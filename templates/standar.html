@@ -1,0 +1,257 @@
+{% extends 'base.html' %}
+{% block title %}Standar SNARS{% endblock %}
+{% block page_title %}Standar SNARS{% endblock %}
+{% block content %}
+
+<!-- Overview Stats -->
+<div class="compliance-overview mb-24">
+  <div class="comp-stat">
+    <div class="comp-stat-val" style="color:var(--brand);">{{ standar_rows|length }}</div>
+    <div class="comp-stat-lbl">Total Standar</div>
+  </div>
+  <div class="comp-stat">
+    <div class="comp-stat-val" style="color:var(--green);">{{ full_count }}</div>
+    <div class="comp-stat-lbl">Terpenuhi</div>
+  </div>
+  <div class="comp-stat">
+    <div class="comp-stat-val" style="color:var(--red);">{{ critical_count }}</div>
+    <div class="comp-stat-lbl">Kritis (0 doc)</div>
+  </div>
+  <div class="comp-stat">
+    <div class="comp-stat-val" style="color:{% if avg_compliance >= 80 %}var(--green){% elif avg_compliance >= 50 %}var(--yellow){% else %}var(--red){% endif %};">{{ avg_compliance }}%</div>
+    <div class="comp-stat-lbl">Avg Compliance</div>
+  </div>
+</div>
+
+<div class="section-header mb-20">
+  <div>
+    <div class="section-sub">Kelola standar dan pantau pemenuhan dokumen</div>
+  </div>
+  <button class="btn btn-primary" onclick="openModal('modalAddStandar')">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+    Tambah Standar
+  </button>
+</div>
+
+<div class="card">
+  {% if standar_rows %}
+  <div class="table-wrap">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Kode</th>
+          <th>Nama Standar</th>
+          <th>Pokja</th>
+          <th>Progress</th>
+          <th>Status</th>
+          <th style="text-align:right;">Aksi</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for s in standar_rows %}
+        {% set pct = [(s['uploaded'] / [s['target_dokumen'],1]|max * 100)|round|int, 100]|min %}
+        <tr>
+          <td data-label="Kode">
+            <span class="font-mono" style="font-weight:800;font-size:13px;color:var(--brand);">{{ s['kode'] }}</span>
+          </td>
+          <td data-label="Nama">
+            <div class="td-main">{{ s['nama'] }}</div>
+          </td>
+          <td data-label="Pokja">
+            {% if s['pokja_name'] %}
+            <span class="badge badge-teal">{{ s['pokja_name'] }}</span>
+            {% else %}
+            <span class="td-muted">—</span>
+            {% endif %}
+          </td>
+          <td data-label="Progress" style="min-width:140px;">
+            <div style="display:flex;align-items:center;gap:10px;">
+              <div class="compliance-bar" style="flex:1;min-width:80px;">
+                <div class="compliance-fill" data-pct="{{ pct }}" style="width:0%;"></div>
+              </div>
+              <span class="font-mono" style="font-size:11.5px;font-weight:700;color:var(--text-3);flex-shrink:0;">
+                {{ s['uploaded'] }}/{{ s['target_dokumen'] }}
+              </span>
+            </div>
+          </td>
+          <td data-label="Status">
+            {% if pct >= 100 %}
+            <span class="badge badge-green">✓ Terpenuhi</span>
+            {% elif pct > 0 %}
+            <span class="badge badge-yellow">⏳ Sebagian</span>
+            {% else %}
+            <span class="badge badge-red">⚠ Kritis</span>
+            {% endif %}
+          </td>
+          <td data-label="Aksi" style="text-align:right;">
+            <div style="display:flex;gap:6px;justify-content:flex-end;">
+              <button class="btn btn-secondary btn-sm" title="Edit"
+                      onclick="openEditStandar({{ s['id'] }}, '{{ s['kode']|e }}', '{{ s['nama']|replace('\'','\\\'') }}', '{{ s['pokja_id'] or '' }}', {{ s['target_dokumen'] }})">
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+                Edit
+              </button>
+              <form method="POST" action="{{ url_for('manage_standar') }}" id="delS-{{ s['id'] }}" style="display:inline;">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <input type="hidden" name="action" value="delete">
+                <input type="hidden" name="standar_id" value="{{ s['id'] }}">
+                <button type="button" class="btn btn-danger btn-sm"
+                        onclick="confirmDelete('delS-{{ s['id'] }}', '{{ s['kode']|e }}')">
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
+                </button>
+              </form>
+            </div>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="empty-state">
+    <div class="empty-state-icon">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+    </div>
+    <div class="empty-state-title">Belum ada standar</div>
+    <div class="empty-state-sub">Tambahkan standar SNARS pertama Anda.</div>
+    <button class="btn btn-primary btn-sm" style="margin-top:14px;" onclick="openModal('modalAddStandar')">+ Tambah Standar</button>
+  </div>
+  {% endif %}
+</div>
+
+<!-- ── MODAL ADD ── -->
+<div class="modal-overlay" id="modalAddStandar" style="display:none;">
+  <div class="modal">
+    <div class="modal-header">
+      <div class="modal-title">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        Tambah Standar SNARS
+      </div>
+      <button class="modal-close" onclick="closeModal('modalAddStandar')" aria-label="Tutup">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+    <form method="POST" action="{{ url_for('manage_standar') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="hidden" name="action" value="add">
+      <div class="form-row-2">
+        <div class="form-group">
+          <label class="form-label">Kode Standar <span class="req">*</span></label>
+          <input type="text" name="kode" placeholder="Contoh: PP.1" required>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Target Dokumen <span class="req">*</span></label>
+          <input type="number" name="target_dokumen" value="1" min="1" max="999" required>
+        </div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Nama Standar <span class="req">*</span></label>
+        <input type="text" name="nama" placeholder="Deskripsi lengkap standar" required>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Pokja</label>
+        <select name="pokja_id">
+          <option value="">— Tidak ada —</option>
+          {% for p in pokja_rows %}
+          <option value="{{ p['id'] }}">{{ p['name'] }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:8px;">
+        <button type="button" class="btn btn-secondary" onclick="closeModal('modalAddStandar')">Batal</button>
+        <button type="submit" class="btn btn-primary">Simpan Standar</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- ── MODAL EDIT ── -->
+<div class="modal-overlay" id="modalEditStandar" style="display:none;">
+  <div class="modal">
+    <div class="modal-header">
+      <div class="modal-title">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+        Edit Standar SNARS
+      </div>
+      <button class="modal-close" onclick="closeModal('modalEditStandar')" aria-label="Tutup">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+    <form method="POST" action="{{ url_for('manage_standar') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="hidden" name="action" value="edit">
+      <input type="hidden" name="standar_id" id="editStandarId">
+
+      <div class="form-row-2">
+        <div class="form-group">
+          <label class="form-label">Kode Standar <span class="req">*</span></label>
+          <input type="text" name="kode" id="editStandarKode" required>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Target Dokumen <span class="req">*</span></label>
+          <input type="number" name="target_dokumen" id="editStandarTarget" min="1" max="999" required>
+        </div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Nama Standar <span class="req">*</span></label>
+        <input type="text" name="nama" id="editStandarNama" required>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Pokja</label>
+        <select name="pokja_id" id="editStandarPokja">
+          <option value="">— Tidak ada —</option>
+          {% for p in pokja_rows %}
+          <option value="{{ p['id'] }}">{{ p['name'] }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:8px;">
+        <button type="button" class="btn btn-secondary" onclick="closeModal('modalEditStandar')">Batal</button>
+        <button type="submit" class="btn btn-primary">Simpan Perubahan</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+// Menjalankan animasi pengisian progress bar setelah tabel termuat
+document.addEventListener("DOMContentLoaded", function() {
+  setTimeout(() => {
+    document.querySelectorAll('.compliance-fill').forEach(bar => {
+      const pct = bar.getAttribute('data-pct');
+      bar.style.width = pct + '%';
+    });
+  }, 100);
+});
+
+// Membuka modal edit dan mengisi nilai form dengan data lama
+function openEditStandar(id, kode, nama, pokjaId, targetDoc) {
+  document.getElementById('editStandarId').value = id;
+  document.getElementById('editStandarKode').value = kode;
+  document.getElementById('editStandarNama').value = nama;
+  document.getElementById('editStandarPokja').value = pokjaId;
+  document.getElementById('editStandarTarget').value = targetDoc;
+  openModal('modalEditStandar');
+}
+
+// Konfirmasi hapus data
+function confirmDelete(formId, kodeStandar) {
+  if (confirm("Apakah Anda yakin ingin menghapus Standar '" + kodeStandar + "'?")) {
+    document.getElementById(formId).submit();
+  }
+}
+
+// Fungsi pembantu modal
+function openModal(modalId) {
+  const modal = document.getElementById(modalId);
+  if (modal) modal.style.display = 'flex';
+}
+
+function closeModal(modalId) {
+  const modal = document.getElementById(modalId);
+  if (modal) modal.style.display = 'none';
+}
+</script>
+{% endblock %}

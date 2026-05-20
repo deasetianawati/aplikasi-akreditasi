@@ -1,0 +1,268 @@
+{% extends 'base.html' %}
+{% block title %}Upload Dokumen{% endblock %}
+{% block page_title %}Upload Dokumen{% endblock %}
+
+{% block head %}
+{{ super() }}
+<style>
+  /* Animasi Pergeseran Warna Gradasi Latar Belakang */
+  @keyframes gradientMotion {
+    0% { background-position: 0% 50%; }
+    50% { background-position: 100% 50%; }
+    100% { background-position: 0% 50%; }
+  }
+
+  /* Animasi Denyut Membesar (Pulse Effect) untuk Area Upload */
+  @keyframes glowPulse {
+    0% { box-shadow: 0 0 0 0 rgba(20, 184, 166, 0.4); }
+    70% { box-shadow: 0 0 0 12px rgba(20, 184, 166, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(20, 184, 166, 0); }
+  }
+
+  /* Memaksa Card Utama Memiliki Latar Belakang Gradasi Premium Cerah */
+  .vibrant-card {
+    background: linear-gradient(-45deg, #e0f2fe, #f0fdfa, #f5f3ff, #f0fdfa) !important;
+    background-size: 400% 400% !important;
+    animation: gradientMotion 10s ease infinite !important;
+    border-radius: 16px !important;
+    border: 1px solid #cbd5e1 !important;
+    box-shadow: 0 10px 25px -5px rgba(13, 148, 136, 0.1) !important;
+  }
+
+  /* Mempercantik Card Header dengan Warna Solid */
+  .vibrant-header {
+    background: linear-gradient(90deg, #0d9488, #06b6d4) !important;
+    color: #ffffff !important;
+    border-bottom: none !important;
+    padding: 18px 24px !important;
+  }
+  .vibrant-header .card-title {
+    color: #ffffff !important;
+    font-weight: 700 !important;
+    display: flex;
+    align-items: center;
+    justify-content: center; /* Membuat judul header berada di tengah */
+    gap: 8px;
+    width: 100%;
+  }
+
+  /* Area Kotak Unggah Berkas Interaktif - Terpusat Sempurna */
+  .premium-upload-box {
+    position: relative;
+    border: 2px dashed #0d9488 !important;
+    background: #ffffff !important;
+    border-radius: 12px !important;
+    padding: 40px 20px;
+    text-align: center; /* Memastikan semua teks inline berada di tengah */
+    cursor: pointer !important;
+    transition: all 0.3s ease-in-out;
+    display: flex;
+    flex-direction: column;
+    align-items: center; /* Memusatkan konten secara horizontal */
+    justify-content: center; /* Memusatkan konten secara vertikal */
+    gap: 10px;
+    width: 100%;
+  }
+
+  .premium-upload-box:hover {
+    transform: scale(1.01);
+    border-color: #14b8a6 !important;
+    box-shadow: 0 12px 20px rgba(13, 148, 136, 0.15) !important;
+    background: #f0fdfa !important;
+  }
+
+  /* Lingkaran Ikon Berpendar */
+  .icon-circle-glow {
+    color: #0d9488;
+    background: #e0f2fe;
+    padding: 14px;
+    border-radius: 50%;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    animation: glowPulse 2s infinite ease-in-out;
+  }
+
+  .premium-upload-box * {
+    pointer-events: none;
+  }
+
+  /* Desain Pil Tipe File */
+  .dropzone-types {
+    margin-top: 12px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    justify-content: center; /* Memastikan barisan pil berada di tengah */
+    align-items: center;
+  }
+
+  .dropzone-type-pill {
+    background: #ffffff !important;
+    border: 1px solid #cbd5e1 !important;
+    color: #334155 !important;
+    padding: 5px 12px !important;
+    border-radius: 20px !important;
+    font-size: 11px !important;
+    font-weight: 700 !important;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.02) !important;
+    display: inline-block;
+  }
+
+  /* Mengubah Desain Tombol Unggah Utama */
+  .btn-vibrant-submit {
+    background: linear-gradient(135deg, #0d9488 0%, #06b6d4 100%) !important;
+    color: #ffffff !important;
+    border: none !important;
+    font-weight: 700 !important;
+    box-shadow: 0 4px 12px rgba(6, 182, 212, 0.3) !important;
+    transition: all 0.2s !important;
+  }
+  .btn-vibrant-submit:hover {
+    transform: translateY(-2px) !important;
+    box-shadow: 0 6px 20px rgba(6, 182, 212, 0.4) !important;
+  }
+
+  /* Pengaturan Baris Form agar Seimbang */
+  .form-row-2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+  }
+  @media (max-width: 768px) {
+    .form-row-2 {
+      grid-template-columns: 1fr;
+    }
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+<div style="max-width:760px; margin: 20px auto 0 auto;"> <!-- Ditambahkan 'auto' agar form berada di tengah halaman browser -->
+
+  <!-- Header Tombol Kembali -->
+  <div style="margin-bottom: 16px;">
+    <a href="{{ url_for('dokumen') }}" class="btn btn-secondary">
+      <svg xmlns="http://w3.org" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="15 18 9 12 15 6"/></svg>
+      Kembali
+    </a>
+  </div>
+
+  <!-- Card Utama Form dengan Gradasi Warna Dinamis -->
+  <div class="card vibrant-card">
+    <div class="card-header vibrant-header">
+      <span class="card-title">
+        <svg xmlns="http://w3.org" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+        Unggah berkas akreditasi ke repositori cloud sistem
+      </span>
+    </div>
+    <div class="card-body" style="padding: 26px;">
+      <form method="POST" enctype="multipart/form-data" id="uploadForm">
+        <input type="hidden" name="csrf_token" value="{{ csrf }}">
+
+        <!-- Area Kotak Upload Interaktif Berpendar -->
+        <div class="form-group">
+          <label class="form-label" style="font-weight: 700; color: #1e293b; display: block; margin-bottom: 8px;">File Dokumen Akreditasi <span class="req">*</span></label>
+
+          <div class="premium-upload-box" id="dropzoneBox" role="button" tabindex="0">
+            <div class="icon-circle-glow">
+              <svg xmlns="http://w3.org" width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+            </div>
+
+            <div id="uploadTitle" style="font-weight: 800; font-size: 16px; color: #0f172a; margin-top: 8px; text-align: center;">Klik di sini untuk memilih berkas</div>
+            <div id="uploadSub" style="color: #475569; font-size: 13px; text-align: center;">atau seret &amp; jatuhkan file dokumen Anda ke sini</div>
+
+            <div class="dropzone-types">
+              <span class="dropzone-type-pill">PDF</span>
+              <span class="dropzone-type-pill">DOCX</span>
+              <span class="dropzone-type-pill">XLSX</span>
+              <span class="dropzone-type-pill">PPTX</span>
+              <span class="dropzone-type-pill">IMAGE</span>
+              <span class="dropzone-type-pill">ZIP / RAR</span>
+              <span class="dropzone-type-pill" style="background: #0d9488 !important; color: #ffffff !important; border: none !important;">Maks 50 MB</span>
+            </div>
+          </div>
+          <input type="file" id="fileInput" name="file" style="display:none;" accept=".pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.jpg,.jpeg,.png,.txt,.zip,.rar" required>
+        </div>
+
+        <!-- Baris Pengisian Pokja dan Standar -->
+        <div class="form-row-2" style="margin-top: 24px;">
+          <div class="form-group">
+            <label class="form-label" for="pokjaSelect" style="font-weight: 700; color: #1e293b;">Pokja <span class="req">*</span></label>
+            <select id="pokjaSelect" name="pokja_id" required style="background: #ffffff !important; border-radius: 8px; width: 100%; padding: 10px;">
+              <option value="">— Pilih Pokja —</option>
+              {% for p in pokja_rows %}
+              <option value="{{ p['id'] }}" {% if request.form.get('pokja_id')|string == p['id']|string %}selected{% endif %}>
+                {{ p['name'] }}
+              </option>
+              {% endfor %}
+            </select>
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="standarSelect" style="font-weight: 700; color: #1e293b;">Standar SNARS</label>
+            <select id="standarSelect" name="standar_id" style="background: #ffffff !important; border-radius: 8px; width: 100%; padding: 10px;">
+              <option value="">— Pilih Standar (opsional) —</option>
+              {% for s in standar_rows %}
+              <option value="{{ s['id'] }}" data-pokja="{{ s['pokja_id'] }}"
+                {% if request.form.get('standar_id')|string == s['id']|string %}selected{% endif %}>
+                {{ s['kode'] }} — {{ s['nama'] }}
+              </option>
+              {% endfor %}
+            </select>
+          </div>
+        </div>
+
+        <div class="form-group" style="margin-top: 16px;">
+          <label class="form-label" for="description" style="font-weight: 700; color: #1e293b;">Deskripsi Dokumen</label>
+          <textarea id="description" name="description" rows="3" placeholder="Jelaskan isi dokumen ini..." style="background: #ffffff !important; border-radius: 8px; width: 100%; padding: 10px; resize: vertical;"></textarea>
+        </div>
+
+        <div class="form-group" style="margin-top: 16px;">
+          <label class="form-label" for="tags" style="font-weight: 700; color: #1e293b;">Tags</label>
+          <input type="text" id="tags" name="tags" placeholder="Contoh: SOP, kebijakan, formulir (pisahkan dengan koma)" style="background: #ffffff !important; border-radius: 8px; width: 100%; padding: 10px;">
+        </div>
+
+        <!-- Tombol Aksi di Bagian Bawah -->
+        <div style="display: flex; justify-content: flex-end; gap: 12px; margin-top: 28px; border-top: 1px solid #cbd5e1; padding-top: 20px;">
+          <button type="button" class="btn btn-secondary" onclick="window.history.back();">Batal</button>
+          <button type="submit" class="btn btn-vibrant-submit">Mulal Upload Berkas</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+
+<!-- JavaScript Ringan untuk Interaktivitas Dropzone -->
+<script>
+  const dropzoneBox = document.getElementById('dropzoneBox');
+  const fileInput = document.getElementById('fileInput');
+  const uploadTitle = document.getElementById('uploadTitle');
+
+  dropzoneBox.addEventListener('click', () => fileInput.click());
+
+  dropzoneBox.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    dropzoneBox.style.borderColor = '#06b6d4';
+    dropzoneBox.style.background = '#ecfeff';
+  });
+
+  dropzoneBox.addEventListener('dragleave', () => {
+    dropzoneBox.style.borderColor = '#0d9488';
+    dropzoneBox.style.background = '#ffffff';
+  });
+
+  dropzoneBox.addEventListener('drop', (e) => {
+    e.preventDefault();
+    if (e.dataTransfer.files.length) {
+      fileInput.files = e.dataTransfer.files;
+      uploadTitle.innerText = e.dataTransfer.files[0].name;
+    }
+  });
+
+  fileInput.addEventListener('change', () => {
+    if (fileInput.files.length) {
+      uploadTitle.innerText = fileInput.files[0].name;
+    }
+  });
+</script>
+{% endblock %}

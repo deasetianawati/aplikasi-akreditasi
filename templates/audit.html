@@ -1,0 +1,114 @@
+{% extends 'base.html' %}
+{% block title %}Audit Trail{% endblock %}
+{% block page_title %}Audit Trail{% endblock %}
+{% block content %}
+
+<div class="section-header mb-24">
+  <div>
+    
+    <div class="section-sub">{{ total }} log aktivitas sistem</div>
+  </div>
+</div>
+
+<!-- Filter -->
+<div class="card mb-20">
+  <form method="GET" action="{{ url_for('audit_trail') }}">
+    <div class="filter-bar">
+      <div class="search-input-wrap">
+        <div class="search-icon">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+        </div>
+        <input type="text" name="q" value="{{ q }}" placeholder="Cari user atau detail...">
+      </div>
+      <select name="action" onchange="this.form.submit()">
+        <option value="all" {% if action_filter == 'all' %}selected{% endif %}>Semua Aksi</option>
+        {% for at in action_types %}
+        <option value="{{ at }}" {% if action_filter == at %}selected{% endif %}>{{ at }}</option>
+        {% endfor %}
+      </select>
+      <button type="submit" class="btn btn-primary btn-sm">Cari</button>
+      {% if q or action_filter != 'all' %}
+      <a href="{{ url_for('audit_trail') }}" class="btn btn-ghost btn-sm">Reset</a>
+      {% endif %}
+    </div>
+  </form>
+</div>
+
+<div class="card">
+  {% if logs %}
+  <div class="table-wrap">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Waktu</th>
+          <th>Aksi</th>
+          <th>User</th>
+          <th>Detail</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for log in logs %}
+        <tr>
+          <td data-label="Waktu">
+            <span class="font-mono td-muted" style="font-size:11.5px;white-space:nowrap;">
+              {{ log['created_at'][:19].replace('T',' ') if log['created_at'] else '—' }}
+            </span>
+          </td>
+          <td data-label="Aksi">
+            {% set a = log['action']|upper %}
+            <span class="action-badge
+              {% if 'LOGIN' in a and 'FAILED' not in a %}ab-login
+              {% elif 'LOGOUT' in a %}ab-logout
+              {% elif 'UPLOAD' in a %}ab-upload
+              {% elif 'DOWNLOAD' in a %}ab-download
+              {% elif 'DELETE' in a %}ab-delete
+              {% elif 'CREATE' in a or 'ADD' in a %}ab-create
+              {% elif 'TOGGLE' in a or 'UPDATE' in a or 'RESET' in a %}ab-toggle
+              {% elif 'EXPORT' in a %}ab-export
+              {% elif 'FAILED' in a %}ab-delete
+              {% else %}ab-default{% endif %}">
+              {{ log['action']|replace('_',' ') }}
+            </span>
+          </td>
+          <td data-label="User">
+            <span style="font-weight:600;font-size:12.5px;">{{ log['user_name'] or '—' }}</span>
+          </td>
+          <td data-label="Detail">
+            <span class="td-muted font-mono" style="font-size:11.5px;word-break:break-all;">
+              {{ log['detail']|truncate(80) if log['detail'] else '—' }}
+            </span>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  {% if total_pages > 1 %}
+  <div style="border-top:1px solid var(--border);padding:12px 16px;">
+    <div class="pagination">
+      <a href="{{ url_for('audit_trail', q=q, action=action_filter, page=1) }}" class="page-btn">«</a>
+      <a href="{{ url_for('audit_trail', q=q, action=action_filter, page=[page-1,1]|max) }}" class="page-btn">‹</a>
+      {% for p in range([page-2,1]|max, [page+3,total_pages+1]|min) %}
+      <a href="{{ url_for('audit_trail', q=q, action=action_filter, page=p) }}"
+         class="page-btn {% if p == page %}active{% endif %}">{{ p }}</a>
+      {% endfor %}
+      <a href="{{ url_for('audit_trail', q=q, action=action_filter, page=[page+1,total_pages]|min) }}" class="page-btn">›</a>
+      <a href="{{ url_for('audit_trail', q=q, action=action_filter, page=total_pages) }}" class="page-btn">»</a>
+    </div>
+    <div style="text-align:center;font-size:12px;color:var(--text-4);margin-top:4px;">
+      Halaman {{ page }} dari {{ total_pages }} · {{ total }} log
+    </div>
+  </div>
+  {% endif %}
+
+  {% else %}
+  <div class="empty-state">
+    <div class="empty-state-icon">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
+    </div>
+    <div class="empty-state-title">Tidak ada log ditemukan</div>
+  </div>
+  {% endif %}
+</div>
+{% endblock %}

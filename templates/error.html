@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="id" data-theme="light">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Error {{ code }} — AkreditasiRS Pro</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;700;800;900&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+</head>
+<body>
+<div class="error-page">
+  <div class="error-card">
+    <div class="error-code">{{ code }}</div>
+    <div style="font-size:22px;font-weight:800;color:var(--text-1);margin:16px 0 8px;">
+      {% if code == 404 %}Halaman Tidak Ditemukan
+      {% elif code == 403 %}Akses Ditolak
+      {% elif code == 500 %}Kesalahan Server
+      {% else %}Terjadi Kesalahan{% endif %}
+    </div>
+    <div style="font-size:14px;color:var(--text-4);margin-bottom:28px;line-height:1.6;">
+      {{ msg }}
+    </div>
+    <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap;">
+      <a href="javascript:history.back()" class="btn btn-secondary">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="15 18 9 12 15 6"/></svg>
+        Kembali
+      </a>
+      <a href="{{ url_for('dashboard') }}" class="btn btn-primary">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/></svg>
+        Dashboard
+      </a>
+    </div>
+  </div>
+</div>
+<script>
+var saved=localStorage.getItem('theme')||'light';
+document.documentElement.setAttribute('data-theme',saved);
+</script>
+</body>
+</html>

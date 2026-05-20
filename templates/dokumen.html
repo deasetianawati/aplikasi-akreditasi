@@ -1,0 +1,201 @@
+{% extends 'base.html' %}
+{% block title %}Semua Dokumen{% endblock %}
+
+{% block content %}
+
+<div class="section-header mb-24">
+  <div>
+    <h2>Semua Dokumen</h2>
+    <div class="section-sub">{{ total_count }} dokumen ditemukan</div>
+  </div>
+  <a href="{{ url_for('upload_file') }}" class="btn btn-primary">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+    Upload Baru
+  </a>
+</div>
+
+<!-- ── FILTER BAR ── -->
+<div class="card mb-20">
+  <form method="GET" action="{{ url_for('dokumen') }}" id="filterForm">
+    <div class="filter-bar">
+      <div class="search-input-wrap">
+        <div class="search-icon">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+        </div>
+        <input type="text" id="searchInput" name="q" value="{{ search }}"
+               placeholder="Cari nama, deskripsi, atau tag..." style="padding-left:38px;">
+      </div>
+      <select name="pokja_id" onchange="this.form.submit()">
+        <option value="all" {% if selected_pokja == 'all' %}selected{% endif %}>Semua Pokja</option>
+        {% for p in pokja_rows %}
+        <option value="{{ p['id'] }}" {% if selected_pokja|string == p['id']|string %}selected{% endif %}>{{ p['name'] }}</option>
+        {% endfor %}
+      </select>
+      <select name="file_type" onchange="this.form.submit()">
+        <option value="all" {% if selected_type == 'all' %}selected{% endif %}>Semua Tipe</option>
+        {% for ft in file_types %}
+        <option value="{{ ft['file_type'] }}" {% if selected_type == ft['file_type'] %}selected{% endif %}>{{ ft['file_type'] }}</option>
+        {% endfor %}
+      </select>
+      <select name="sort" onchange="this.form.submit()">
+        <option value="newest" {% if sort == 'newest' %}selected{% endif %}>Terbaru</option>
+        <option value="oldest" {% if sort == 'oldest' %}selected{% endif %}>Terlama</option>
+        <option value="name"   {% if sort == 'name'   %}selected{% endif %}>Nama A-Z</option>
+        <option value="size"   {% if sort == 'size'   %}selected{% endif %}>Ukuran</option>
+      </select>
+      <button type="submit" class="btn btn-primary btn-sm">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+        Cari
+      </button>
+      {% if search or selected_pokja != 'all' or selected_type != 'all' %}
+      <a href="{{ url_for('dokumen') }}" class="btn btn-ghost btn-sm">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        Reset
+      </a>
+      {% endif %}
+    </div>
+  </form>
+</div>
+
+<!-- ── TABLE ── -->
+<div class="card">
+  {% if files %}
+  <div class="table-wrap">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Dokumen</th>
+          <th>Pokja / Standar</th>
+          <th>Tipe</th>
+          <th>Ukuran</th>
+          <th>Upload</th>
+          <th>Oleh</th>
+          <th style="text-align:right;">Aksi</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for f in files %}
+        <tr>
+          <td data-label="Dokumen">
+            <div style="display:flex;align-items:center;gap:10px;">
+              <div class="file-icon fi-{{ f['file_type']|lower }}">{{ f['file_type'] }}</div>
+              <div style="min-width:0;">
+                <div class="td-main td-clamp" title="{{ f['original_name'] }}">{{ f['original_name'] }}</div>
+                {% if f['description'] %}
+                <div class="td-muted td-clamp" style="max-width:200px;" title="{{ f['description'] }}">{{ f['description'] }}</div>
+                {% endif %}
+                {% if f['tags'] %}
+                <div style="margin-top:3px;display:flex;flex-wrap:wrap;gap:4px;">
+                  {% for tag in f['tags'].split(',')[:3] %}
+                  {% if tag.strip() %}
+                  <span class="badge badge-gray" style="font-size:10px;padding:1px 7px;">{{ tag.strip() }}</span>
+                  {% endif %}
+                  {% endfor %}
+                </div>
+                {% endif %}
+              </div>
+            </div>
+          </td>
+          <td data-label="Pokja">
+            <div style="font-weight:600;font-size:12.5px;">{{ f['pokja_name'] }}</div>
+            {% if f['standar_kode'] %}
+            <div class="td-muted" style="font-family:'JetBrains Mono',monospace;">
+              {{ f['standar_kode'] }} · {{ f['standar_nama']|truncate(30) }}
+            </div>
+            {% endif %}
+          </td>
+          <td data-label="Tipe">
+            <span class="badge badge-teal">{{ f['file_type'] }}</span>
+          </td>
+          <td data-label="Ukuran">
+            <span class="td-muted font-mono" style="font-size:12px;">
+              {% if f['file_size'] %}
+                {% if f['file_size'] > 1048576 %}{{ "%.1f"|format(f['file_size']/1048576) }} MB
+                {% else %}{{ "%.1f"|format(f['file_size']/1024) }} KB{% endif %}
+              {% else %}—{% endif %}
+            </span>
+          </td>
+          <td data-label="Upload">
+            <span class="td-muted font-mono" style="font-size:11.5px;">
+              {{ f['uploaded_at'][:10] if f['uploaded_at'] else '—' }}
+            </span>
+          </td>
+          <td data-label="Oleh">
+            <span style="font-size:12.5px;">{{ f['uploader_name'] }}</span>
+          </td>
+          <td data-label="Aksi" style="text-align:right;">
+            <div style="display:flex;gap:6px;justify-content:flex-end;flex-wrap:nowrap;">
+              <a href="{{ url_for('download_file', fid=f['id']) }}"
+                 class="btn btn-secondary btn-sm" title="Download">
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="8 17 12 21 16 17"/><line x1="12" y1="12" x2="12" y2="21"/><path d="M20.88 18.09A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.29"/></svg>
+                <span class="hide-xs">Unduh</span>
+              </a>
+              {% if g.user['role'] == 'admin' %}
+             <form method="POST" action="{{ url_for('delete_file', fid=f['id']) }}" style="display:inline;"
+      onsubmit="return confirm('Apakah Anda yakin ingin menghapus file ini?')">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <button type="submit" class="btn btn-danger btn-sm" title="Hapus">
+        <svg xmlns="http://w3.org" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="3 6 5 6 21 6"/>
+            <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>
+        </svg>
+    </button>
+</form>
+
+            
+              {% endif %}
+            </div>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Pagination -->
+  {% if total_pages > 1 %}
+  <div style="border-top:1px solid var(--border);padding:12px 16px;">
+    <div class="pagination">
+      <a href="{{ url_for('dokumen', q=search, pokja_id=selected_pokja, file_type=selected_type, sort=sort, page=1) }}"
+         class="page-btn {% if page == 1 %}disabled{% endif %}" aria-label="Halaman pertama">«</a>
+      <a href="{{ url_for('dokumen', q=search, pokja_id=selected_pokja, file_type=selected_type, sort=sort, page=[page-1,1]|max) }}"
+         class="page-btn {% if page == 1 %}disabled{% endif %}" aria-label="Sebelumnya">‹</a>
+
+      {% for p in range([page-2,1]|max, [page+3,total_pages+1]|min) %}
+      <a href="{{ url_for('dokumen', q=search, pokja_id=selected_pokja, file_type=selected_type, sort=sort, page=p) }}"
+         class="page-btn {% if p == page %}active{% endif %}">{{ p }}</a>
+      {% endfor %}
+
+      <a href="{{ url_for('dokumen', q=search, pokja_id=selected_pokja, file_type=selected_type, sort=sort, page=[page+1,total_pages]|min) }}"
+         class="page-btn {% if page == total_pages %}disabled{% endif %}" aria-label="Berikutnya">›</a>
+      <a href="{{ url_for('dokumen', q=search, pokja_id=selected_pokja, file_type=selected_type, sort=sort, page=total_pages) }}"
+         class="page-btn {% if page == total_pages %}disabled{% endif %}" aria-label="Halaman terakhir">»</a>
+    </div>
+    <div style="text-align:center;font-size:12px;color:var(--text-4);margin-top:4px;">
+      Halaman {{ page }} dari {{ total_pages }} · {{ total_count }} dokumen
+    </div>
+  </div>
+  {% endif %}
+
+  {% else %}
+  <div class="empty-state">
+    <div class="empty-state-icon">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+    </div>
+    <div class="empty-state-title">Tidak ada dokumen</div>
+    <div class="empty-state-sub">
+      {% if search %}Tidak ada hasil untuk "<strong>{{ search }}</strong>".{% else %}Belum ada dokumen. Upload sekarang!{% endif %}
+    </div>
+    <div style="margin-top:16px;">
+      {% if search %}
+      <a href="{{ url_for('dokumen') }}" class="btn btn-secondary btn-sm">Reset Pencarian</a>
+      {% endif %}
+      <a href="{{ url_for('upload_file') }}" class="btn btn-primary btn-sm">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        Upload Dokumen
+      </a>
+    </div>
+  </div>
+  {% endif %}
+</div>
+{% endblock %}
