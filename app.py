@@ -1012,9 +1012,10 @@ def init_db():
     logger.info("Database initialized — Pro v3.0")
 
 
+init_db()
+app = create_app()
+
 if __name__ == "__main__":
-    init_db()
-    app  = create_app()
     host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "8000"))
     debug = os.environ.get("DEBUG", "false").lower() == "true"
