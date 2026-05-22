@@ -1,179 +1,619 @@
 {% extends 'base.html' %}
 {% block title %}Kelola Pokja{% endblock %}
 {% block page_title %}Kelola Pokja{% endblock %}
+
 {% block content %}
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800;900&display=swap');
 
-<div class="section-header mb-24">
-  <div>
-    <div class="section-sub">{{ pokja_rows|length }} pokja terdaftar</div>
+  /* ── Root overrides untuk halaman ini ── */
+  .pokja-page * { font-family: 'Plus Jakarta Sans', sans-serif; }
+
+  @keyframes fadeUp {
+    from { opacity:0; transform:translateY(20px); }
+    to   { opacity:1; transform:translateY(0); }
+  }
+  @keyframes scaleIn {
+    from { opacity:0; transform:scale(0.97); }
+    to   { opacity:1; transform:scale(1); }
+  }
+  @keyframes fillBar {
+    from { width: 0; }
+  }
+  @keyframes shimmer {
+    0%   { background-position: -400px 0; }
+    100% { background-position: 400px 0; }
+  }
+
+  /* ── Page wrapper ── */
+  .pokja-page { animation: fadeUp .45s ease both; }
+
+  /* ── Top summary strip ── */
+  .pkj-summary {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 12px;
+    margin-bottom: 28px;
+  }
+  .pkj-sum-card {
+    background: #fff;
+    border: 1px solid #e8edf3;
+    border-radius: 14px;
+    padding: 18px 20px;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    box-shadow: 0 1px 4px rgba(15,23,42,.05);
+    transition: box-shadow .2s, transform .2s;
+  }
+  .pkj-sum-card:hover {
+    box-shadow: 0 4px 16px rgba(15,23,42,.09);
+    transform: translateY(-2px);
+  }
+  .pkj-sum-icon {
+    width: 44px; height: 44px;
+    border-radius: 11px;
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+  }
+  .pkj-sum-icon svg { width: 20px; height: 20px; }
+  .pkj-sum-val  { font-size: 26px; font-weight: 900; line-height: 1; letter-spacing: -1px; color: #0f172a; }
+  .pkj-sum-lbl  { font-size: 11.5px; font-weight: 600; color: #94a3b8; text-transform: uppercase; letter-spacing: .04em; margin-top: 3px; }
+
+  /* ── Section header ── */
+  .pkj-header {
+    display: flex; align-items: flex-end; justify-content: space-between;
+    margin-bottom: 20px;
+  }
+  .pkj-header-title {
+    font-size: 20px; font-weight: 800; color: #0f172a; letter-spacing: -.4px;
+  }
+  .pkj-header-sub {
+    font-size: 13px; color: #94a3b8; font-weight: 500; margin-top: 3px;
+  }
+
+  /* ── Add button ── */
+  .btn-add-pokja {
+    display: inline-flex; align-items: center; gap: 7px;
+    background: #0f172a; color: #fff;
+    border: none; border-radius: 10px;
+    padding: 10px 18px;
+    font-size: 13px; font-weight: 700;
+    cursor: pointer;
+    transition: background .18s, box-shadow .18s, transform .15s;
+    box-shadow: 0 2px 8px rgba(15,23,42,.18);
+    font-family: inherit;
+  }
+  .btn-add-pokja:hover {
+    background: #1e293b;
+    box-shadow: 0 4px 16px rgba(15,23,42,.22);
+    transform: translateY(-1px);
+  }
+  .btn-add-pokja svg { width: 14px; height: 14px; }
+
+  /* ── Pokja grid ── */
+  .pkj-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(330px, 1fr));
+    gap: 16px;
+  }
+
+  /* ── Pokja card ── */
+  .pkj-card {
+    background: #fff;
+    border: 1px solid #e8edf3;
+    border-radius: 16px;
+    overflow: hidden;
+    box-shadow: 0 1px 4px rgba(15,23,42,.05);
+    transition: box-shadow .22s, transform .22s;
+    animation: scaleIn .38s ease both;
+  }
+  .pkj-card:hover {
+    box-shadow: 0 8px 28px rgba(15,23,42,.10);
+    transform: translateY(-3px);
+  }
+
+  /* Accent bar kiri — lebih bold dari top bar */
+  .pkj-card-inner {
+    display: flex;
+    min-height: 100%;
+  }
+  .pkj-accent-bar {
+    width: 4px;
+    flex-shrink: 0;
+    border-radius: 0;
+  }
+  .pkj-card-body { flex: 1; padding: 20px; }
+
+  /* Header avatar + nama */
+  .pkj-card-head {
+    display: flex; align-items: flex-start; gap: 13px;
+    margin-bottom: 18px;
+  }
+  .pkj-avatar {
+    width: 46px; height: 46px;
+    border-radius: 13px;
+    flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 900; font-size: 15px; letter-spacing: -.5px;
+  }
+  .pkj-name {
+    font-size: 14.5px; font-weight: 800; color: #0f172a;
+    line-height: 1.3; margin-bottom: 3px;
+  }
+  .pkj-desc {
+    font-size: 12px; color: #94a3b8; font-weight: 500;
+    line-height: 1.4;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  }
+  .pkj-badge {
+    margin-left: auto; flex-shrink: 0; margin-top: 1px;
+    padding: 3px 9px; border-radius: 6px;
+    font-size: 10.5px; font-weight: 800; letter-spacing: .03em;
+    text-transform: uppercase;
+  }
+  .pkj-badge.green  { background: #dcfce7; color: #15803d; }
+  .pkj-badge.yellow { background: #fef9c3; color: #854d0e; }
+  .pkj-badge.red    { background: #fee2e2; color: #b91c1c; }
+  .pkj-badge.gray   { background: #f1f5f9; color: #94a3b8; }
+
+  /* Stats 3‑col */
+  .pkj-stats {
+    display: grid; grid-template-columns: repeat(3,1fr);
+    border: 1px solid #f1f5f9; border-radius: 11px; overflow: hidden;
+    margin-bottom: 16px;
+    background: #fafbfc;
+  }
+  .pkj-stat-cell {
+    padding: 11px 6px; text-align: center;
+    border-right: 1px solid #f1f5f9;
+  }
+  .pkj-stat-cell:last-child { border-right: none; }
+  .pkj-stat-num { font-size: 20px; font-weight: 900; line-height: 1.1; }
+  .pkj-stat-lbl {
+    font-size: 9.5px; font-weight: 700; color: #94a3b8;
+    text-transform: uppercase; letter-spacing: .06em; margin-top: 3px;
+  }
+
+  /* Progress bar */
+  .pkj-progress-wrap { margin-bottom: 18px; }
+  .pkj-progress-head {
+    display: flex; justify-content: space-between;
+    font-size: 11.5px; font-weight: 600; margin-bottom: 6px;
+  }
+  .pkj-progress-lbl { color: #94a3b8; }
+  .pkj-progress-pct { color: #0f172a; font-weight: 800; }
+  .pkj-track {
+    height: 6px; background: #f1f5f9; border-radius: 99px; overflow: hidden;
+  }
+  .pkj-fill {
+    height: 100%; border-radius: 99px;
+    transition: width 1s cubic-bezier(.16,1,.3,1);
+    width: 0%;
+  }
+  .pkj-fill.high   { background: linear-gradient(90deg, #22c55e, #16a34a); }
+  .pkj-fill.medium { background: linear-gradient(90deg, #f59e0b, #d97706); }
+  .pkj-fill.low    { background: linear-gradient(90deg, #ef4444, #dc2626); }
+
+  /* Action row */
+  .pkj-actions { display: flex; gap: 8px; }
+  .btn-edit-pkj {
+    flex: 1; display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+    background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 9px;
+    color: #475569; font-size: 12.5px; font-weight: 700;
+    padding: 8px 12px; cursor: pointer; transition: all .16s;
+    font-family: inherit;
+  }
+  .btn-edit-pkj:hover { background: #f1f5f9; border-color: #cbd5e1; color: #0f172a; }
+  .btn-edit-pkj svg { width: 13px; height: 13px; }
+
+  .btn-del-pkj {
+    width: 36px; height: 36px; border-radius: 9px; flex-shrink: 0;
+    background: #fff5f5; border: 1px solid #fecaca; color: #ef4444;
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer; transition: all .16s;
+    font-family: inherit;
+  }
+  .btn-del-pkj:hover { background: #fee2e2; border-color: #fca5a5; }
+  .btn-del-pkj svg { width: 14px; height: 14px; }
+
+  /* ── Empty state ── */
+  .pkj-empty {
+    text-align: center; padding: 64px 24px;
+    background: #fff; border: 1px dashed #e2e8f0;
+    border-radius: 16px;
+  }
+  .pkj-empty-icon {
+    width: 64px; height: 64px; border-radius: 18px;
+    background: #f8fafc; margin: 0 auto 16px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .pkj-empty-icon svg { width: 30px; height: 30px; color: #94a3b8; }
+  .pkj-empty-title { font-size: 16px; font-weight: 800; color: #0f172a; margin-bottom: 6px; }
+  .pkj-empty-sub   { font-size: 13px; color: #94a3b8; max-width: 320px; margin: 0 auto 20px; line-height: 1.6; }
+
+  /* ── Modal ── */
+  .pkj-overlay {
+    display: none; position: fixed; inset: 0; z-index: 9999;
+    background: rgba(15,23,42,.45); backdrop-filter: blur(4px);
+    align-items: center; justify-content: center;
+    animation: fadeUp .2s ease both;
+  }
+  .pkj-modal {
+    background: #fff; border-radius: 18px;
+    width: 100%; max-width: 460px; margin: 16px;
+    box-shadow: 0 24px 64px rgba(15,23,42,.18);
+    overflow: hidden;
+    animation: scaleIn .22s ease both;
+  }
+  .pkj-modal-header {
+    padding: 20px 24px 16px;
+    border-bottom: 1px solid #f1f5f9;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .pkj-modal-title {
+    font-size: 15px; font-weight: 800; color: #0f172a;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .pkj-modal-title svg { width: 16px; height: 16px; color: #64748b; }
+  .pkj-modal-close {
+    width: 30px; height: 30px; border-radius: 8px;
+    background: #f1f5f9; border: none; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    color: #64748b; transition: background .15s, color .15s;
+    font-family: inherit;
+  }
+  .pkj-modal-close:hover { background: #e2e8f0; color: #0f172a; }
+  .pkj-modal-close svg  { width: 14px; height: 14px; }
+  .pkj-modal-body { padding: 20px 24px; }
+  .pkj-modal-footer {
+    padding: 16px 24px;
+    border-top: 1px solid #f1f5f9;
+    display: flex; gap: 10px; justify-content: flex-end;
+  }
+
+  /* Form fields dalam modal */
+  .pkj-label {
+    display: block; font-size: 12px; font-weight: 700;
+    color: #475569; margin-bottom: 6px; text-transform: uppercase; letter-spacing: .04em;
+  }
+  .pkj-label .req { color: #ef4444; margin-left: 2px; }
+  .pkj-input, .pkj-textarea {
+    width: 100%; border: 1.5px solid #e2e8f0; border-radius: 10px;
+    padding: 10px 13px; font-size: 13.5px; font-family: inherit;
+    color: #0f172a; background: #fff; transition: border-color .18s, box-shadow .18s;
+    box-sizing: border-box;
+  }
+  .pkj-input:focus, .pkj-textarea:focus {
+    outline: none; border-color: #6366f1;
+    box-shadow: 0 0 0 3px rgba(99,102,241,.12);
+  }
+  .pkj-textarea { resize: vertical; min-height: 80px; }
+  .pkj-hint { font-size: 11.5px; color: #94a3b8; margin-top: 5px; font-weight: 500; }
+  .pkj-form-group { margin-bottom: 16px; }
+
+  /* Modal buttons */
+  .btn-cancel-pkj {
+    padding: 9px 18px; border-radius: 9px;
+    background: #f8fafc; border: 1.5px solid #e2e8f0;
+    color: #475569; font-size: 13px; font-weight: 700;
+    cursor: pointer; transition: all .16s; font-family: inherit;
+  }
+  .btn-cancel-pkj:hover { background: #f1f5f9; }
+  .btn-save-pkj {
+    padding: 9px 20px; border-radius: 9px;
+    background: #0f172a; border: none;
+    color: #fff; font-size: 13px; font-weight: 700;
+    cursor: pointer; transition: background .18s, box-shadow .18s; font-family: inherit;
+  }
+  .btn-save-pkj:hover { background: #1e293b; box-shadow: 0 3px 12px rgba(15,23,42,.2); }
+
+  @media (max-width: 700px) {
+    .pkj-summary { grid-template-columns: 1fr 1fr; }
+    .pkj-grid    { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 400px) {
+    .pkj-summary { grid-template-columns: 1fr; }
+  }
+</style>
+
+<div class="pokja-page">
+
+  {# ── Summary strip ── #}
+  <div class="pkj-summary">
+    <div class="pkj-sum-card">
+      <div class="pkj-sum-icon" style="background:#eff6ff;">
+        <svg fill="none" stroke="#3b82f6" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"/></svg>
+      </div>
+      <div>
+        <div class="pkj-sum-val">{{ pokja_rows|length }}</div>
+        <div class="pkj-sum-lbl">Total Pokja</div>
+      </div>
+    </div>
+    <div class="pkj-sum-card">
+      <div class="pkj-sum-icon" style="background:#f0fdf4;">
+        <svg fill="none" stroke="#22c55e" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+      </div>
+      <div>
+        <div class="pkj-sum-val">{{ pokja_rows | sum(attribute='total_files') }}</div>
+        <div class="pkj-sum-lbl">Total Dokumen</div>
+      </div>
+    </div>
+    <div class="pkj-sum-card">
+      <div class="pkj-sum-icon" style="background:#fdf4ff;">
+        <svg fill="none" stroke="#a855f7" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
+      </div>
+      <div>
+        <div class="pkj-sum-val">{{ pokja_rows | sum(attribute='total_users') }}</div>
+        <div class="pkj-sum-lbl">Total Anggota</div>
+      </div>
+    </div>
+    <div class="pkj-sum-card">
+      <div class="pkj-sum-icon" style="background:#fff7ed;">
+        <svg fill="none" stroke="#f97316" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4"/></svg>
+      </div>
+      <div>
+        <div class="pkj-sum-val">{{ pokja_rows | sum(attribute='total_standar') }}</div>
+        <div class="pkj-sum-lbl">Total Standar</div>
+      </div>
+    </div>
   </div>
-  <button class="btn btn-primary" onclick="openModal('modalAddPokja')">
-    <svg xmlns="http://w3.org" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-    Tambah Pokja
-  </button>
-</div>
 
-{% if pokja_rows %}
-<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px;margin-bottom:24px;">
-  {% for p in pokja_rows %}
-  <div class="card" style="overflow:visible;">
-    <div style="padding:20px;">
-      <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:14px;">
-        <div style="display:flex;align-items:center;gap:12px;">
-          <div style="width:44px;height:44px;border-radius:12px;background:var(--brand-xlight);color:var(--brand);display:flex;align-items:center;justify-content:center;flex-shrink:0;font-weight:900;font-size:16px;">
-            {{ p['name'][0]|upper }}
-          </div>
-          <div>
-            <div style="font-weight:800;font-size:14px;color:var(--text-1);">{{ p['name'] }}</div>
-            {% if p['description'] %}
-            <div style="font-size:12px;color:var(--text-4);margin-top:2px;">{{ p['description']|truncate(50) }}</div>
+  {# ── Section header ── #}
+  <div class="pkj-header">
+    <div>
+      <div class="pkj-header-title">Kelompok Kerja Akreditasi</div>
+      <div class="pkj-header-sub">{{ pokja_rows|length }} pokja terdaftar — SNARS Edisi 1</div>
+    </div>
+    <button class="btn-add-pokja" onclick="openModal('modalAddPokja')">
+      <svg fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+      Tambah Pokja
+    </button>
+  </div>
+
+  {# ── Pokja cards ── #}
+  {% if pokja_rows %}
+
+  {# Accent colours: accent bar + avatar bg + avatar text #}
+  {% set palettes = [
+    ('#6366f1', '#eff6ff',   '#3b82f6'),
+    ('#0ea5e9', '#f0fdf4',   '#16a34a'),
+    ('#f97316', '#fff7ed',   '#ea580c'),
+    ('#a855f7', '#fdf4ff',   '#9333ea'),
+    ('#14b8a6', '#f0fdfa',   '#0d9488'),
+    ('#ec4899', '#fdf2f8',   '#db2777')
+  ] %}
+
+  <div class="pkj-grid">
+    {% for p in pokja_rows %}
+    {% set pal = palettes[loop.index0 % 6] %}
+    {% set compliance_pct = [(p['total_files'] / [p['total_standar'],1]|max * 100)|round|int, 100]|min if p['total_standar'] > 0 else 0 %}
+
+    {# Inisial 2 huruf #}
+    {% set words = p['name'].split() %}
+    {% set abbr = namespace(val='') %}
+    {% for w in words %}
+      {% if w|lower not in ['pokja','dan','&','the','of','di','ke','dan'] and abbr.val|length < 2 %}
+        {% set abbr.val = abbr.val + w[0]|upper %}
+      {% endif %}
+    {% endfor %}
+    {% if abbr.val|length < 1 %}{% set abbr.val = p['name'][0]|upper %}{% endif %}
+
+    <div class="pkj-card" style="animation-delay: {{ loop.index0 * 0.06 }}s;">
+      <div class="pkj-card-inner">
+
+        {# Accent bar kiri #}
+        <div class="pkj-accent-bar" style="background:{{ pal[0] }};"></div>
+
+        <div class="pkj-card-body">
+
+          {# Header #}
+          <div class="pkj-card-head">
+            <div class="pkj-avatar" style="background:{{ pal[1] }}; color:{{ pal[2] }};">
+              {{ abbr.val }}
+            </div>
+            <div style="flex:1; min-width:0;">
+              <div class="pkj-name">{{ p['name'] }}</div>
+              <div class="pkj-desc">
+                {% if p['description'] %}{{ p['description'] }}{% else %}<em style="color:#cbd5e1;">Belum ada deskripsi</em>{% endif %}
+              </div>
+            </div>
+            {% if compliance_pct >= 80 %}
+              <span class="pkj-badge green">Baik</span>
+            {% elif compliance_pct >= 40 %}
+              <span class="pkj-badge yellow">Sedang</span>
+            {% elif p['total_standar'] == 0 %}
+              <span class="pkj-badge gray">—</span>
+            {% else %}
+              <span class="pkj-badge red">Kritis</span>
             {% endif %}
           </div>
+
+          {# Stats #}
+          <div class="pkj-stats">
+            <div class="pkj-stat-cell">
+              <div class="pkj-stat-num" style="color:#3b82f6;">{{ p['total_files'] }}</div>
+              <div class="pkj-stat-lbl">Dokumen</div>
+            </div>
+            <div class="pkj-stat-cell">
+              <div class="pkj-stat-num" style="color:#a855f7;">{{ p['total_users'] }}</div>
+              <div class="pkj-stat-lbl">Anggota</div>
+            </div>
+            <div class="pkj-stat-cell">
+              <div class="pkj-stat-num" style="color:#f97316;">{{ p['total_standar'] }}</div>
+              <div class="pkj-stat-lbl">Standar</div>
+            </div>
+          </div>
+
+          {# Progress — hanya jika ada standar #}
+          {% if p['total_standar'] > 0 %}
+          <div class="pkj-progress-wrap">
+            <div class="pkj-progress-head">
+              <span class="pkj-progress-lbl">Kelengkapan dokumen</span>
+              <span class="pkj-progress-pct">{{ compliance_pct }}%</span>
+            </div>
+            <div class="pkj-track">
+              <div class="pkj-fill {% if compliance_pct >= 80 %}high{% elif compliance_pct >= 40 %}medium{% else %}low{% endif %}"
+                   data-pct="{{ compliance_pct }}"></div>
+            </div>
+          </div>
+          {% endif %}
+
+          {# Actions #}
+          <div class="pkj-actions">
+            <button class="btn-edit-pkj"
+                    onclick="openEditPokja({{ p['id'] }}, '{{ p['name']|replace('\'','\\\'') }}', '{{ (p['description'] or '')|replace('\'','\\\'') }}')">
+              <svg fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+              Edit Pokja
+            </button>
+            <form method="POST" action="{{ url_for('manage_pokja') }}" id="delP-{{ p['id'] }}" style="display:contents;">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+              <input type="hidden" name="action" value="delete">
+              <input type="hidden" name="pokja_id" value="{{ p['id'] }}">
+              <button type="button" class="btn-del-pkj" title="Hapus {{ p['name'] }}"
+                      onclick="confirmDelete('delP-{{ p['id'] }}', '{{ p['name']|e }}')">
+                <svg fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
+              </button>
+            </form>
+          </div>
+
         </div>
       </div>
-      <!-- Stats row -->
-      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:0;border:1.5px solid var(--border);border-radius:10px;overflow:hidden;margin-bottom:16px;">
-        <div style="padding:10px;text-align:center;border-right:1px solid var(--border);">
-          <div style="font-size:18px;font-weight:900;color:var(--blue);">{{ p['total_files'] }}</div>
-          <div style="font-size:10px;color:var(--text-4);font-weight:700;text-transform:uppercase;letter-spacing:.05em;">Dokumen</div>
+    </div>
+    {% endfor %}
+  </div>
+
+  {% else %}
+  <div class="pkj-empty">
+    <div class="pkj-empty-icon">
+      <svg fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"/></svg>
+    </div>
+    <div class="pkj-empty-title">Belum ada pokja</div>
+    <div class="pkj-empty-sub">Tambahkan pokja pertama untuk mulai mengelola kelompok kerja akreditasi RS.</div>
+    <button class="btn-add-pokja" onclick="openModal('modalAddPokja')">
+      <svg fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+      Tambah Pokja Pertama
+    </button>
+  </div>
+  {% endif %}
+
+
+  {# ── Modal Tambah ── #}
+  <div class="pkj-overlay" id="modalAddPokja">
+    <div class="pkj-modal">
+      <div class="pkj-modal-header">
+        <div class="pkj-modal-title">
+          <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+          Tambah Pokja Baru
         </div>
-        <div style="padding:10px;text-align:center;border-right:1px solid var(--border);">
-          <div style="font-size:18px;font-weight:900;color:var(--green);">{{ p['total_users'] }}</div>
-          <div style="font-size:10px;color:var(--text-4);font-weight:700;text-transform:uppercase;letter-spacing:.05em;">Anggota</div>
-        </div>
-        <div style="padding:10px;text-align:center;">
-          <div style="font-size:18px;font-weight:900;color:var(--purple);">{{ p['total_standar'] }}</div>
-          <div style="font-size:10px;color:var(--text-4);font-weight:700;text-transform:uppercase;letter-spacing:.05em;">Standar</div>
-        </div>
-      </div>
-      <!-- Actions -->
-      <div style="display:flex;gap:8px;">
-        <button class="btn btn-secondary btn-sm" style="flex:1;" title="Edit"
-                onclick="openEditPokja({{ p['id'] }}, '{{ p['name']|replace('\'','\\\'') }}', '{{ p['description']|replace('\'','\\\'') if p['description'] else '' }}')">
-          <svg xmlns="http://w3.org" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
-          Edit
+        <button class="pkj-modal-close" onclick="closeModal('modalAddPokja')">
+          <svg fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
         </button>
-        <form method="POST" action="{{ url_for('manage_pokja') }}" id="delP-{{ p['id'] }}" style="display:inline;">
-          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-          <input type="hidden" name="action" value="delete">
-          <input type="hidden" name="pokja_id" value="{{ p['id'] }}">
-          <button type="button" class="btn btn-danger btn-sm"
-                  onclick="confirmDelete('delP-{{ p['id'] }}', '{{ p['name']|e }}')" title="Hapus">
-            <svg xmlns="http://w3.org" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
-          </button>
-        </form>
       </div>
+      <form method="POST" action="{{ url_for('manage_pokja') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <input type="hidden" name="action" value="add">
+        <div class="pkj-modal-body">
+          <div class="pkj-form-group">
+            <label class="pkj-label">Nama Pokja <span class="req">*</span></label>
+            <input class="pkj-input" type="text" name="name" placeholder="Contoh: Pokja Pelayanan Klinis" required autofocus>
+            <div class="pkj-hint">Nama akan tampil di seluruh halaman aplikasi</div>
+          </div>
+          <div class="pkj-form-group" style="margin-bottom:0;">
+            <label class="pkj-label">Deskripsi</label>
+            <textarea class="pkj-textarea" name="description" placeholder="Ruang lingkup dan tanggung jawab pokja..."></textarea>
+          </div>
+        </div>
+        <div class="pkj-modal-footer">
+          <button type="button" class="btn-cancel-pkj" onclick="closeModal('modalAddPokja')">Batal</button>
+          <button type="submit" class="btn-save-pkj">Simpan Pokja</button>
+        </div>
+      </form>
     </div>
   </div>
-  {% endfor %}
-</div>
-{% else %}
-<div class="card">
-  <div class="empty-state">
-    <div class="empty-state-icon">
-      <svg xmlns="http://w3.org" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
-    </div>
-    <div class="empty-state-title">Belum ada pokja</div>
-    <button class="btn btn-primary btn-sm" style="margin-top:14px;" onclick="openModal('modalAddPokja')">+ Tambah Pokja</button>
-  </div>
-</div>
-{% endif %}
 
-<!-- MODAL ADD POKJA -->
-<div class="modal-overlay" id="modalAddPokja" style="display:none;">
-  <div class="modal">
-    <div class="modal-header">
-      <div class="modal-title">
-        <svg xmlns="http://w3.org" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-        Tambah Pokja Baru
+  {# ── Modal Edit ── #}
+  <div class="pkj-overlay" id="modalEditPokja">
+    <div class="pkj-modal">
+      <div class="pkj-modal-header">
+        <div class="pkj-modal-title">
+          <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+          Edit Pokja
+        </div>
+        <button class="pkj-modal-close" onclick="closeModal('modalEditPokja')">
+          <svg fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
       </div>
-      <button class="modal-close" onclick="closeModal('modalAddPokja')" aria-label="Tutup">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-      </button>
+      <form method="POST" action="{{ url_for('manage_pokja') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <input type="hidden" name="action" value="edit">
+        <input type="hidden" name="pokja_id" id="editPokjaId">
+        <div class="pkj-modal-body">
+          <div class="pkj-form-group">
+            <label class="pkj-label">Nama Pokja <span class="req">*</span></label>
+            <input class="pkj-input" type="text" name="name" id="editPokjaName" required>
+          </div>
+          <div class="pkj-form-group" style="margin-bottom:0;">
+            <label class="pkj-label">Deskripsi</label>
+            <textarea class="pkj-textarea" name="description" id="editPokjaDesc"></textarea>
+          </div>
+        </div>
+        <div class="pkj-modal-footer">
+          <button type="button" class="btn-cancel-pkj" onclick="closeModal('modalEditPokja')">Batal</button>
+          <button type="submit" class="btn-save-pkj">Simpan Perubahan</button>
+        </div>
+      </form>
     </div>
-    <form method="POST" action="{{ url_for('manage_pokja') }}">
-      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-      <input type="hidden" name="action" value="add">
-      <div class="form-group">
-        <label class="form-label">Nama Pokja <span class="req">*</span></label>
-        <input type="text" name="name" placeholder="Contoh: Pokja Pelayanan Klinis" required autofocus>
-      </div>
-      <div class="form-group">
-        <label class="form-label">Deskripsi</label>
-        <textarea name="description" rows="3" placeholder="Deskripsi singkat pokja..."></textarea>
-      </div>
-      <div style="display:flex;gap:10px;justify-content:flex-end;">
-        <button type="button" class="btn btn-secondary" onclick="closeModal('modalAddPokja')">Batal</button>
-        <button type="submit" class="btn btn-primary">Simpan Pokja</button>
-      </div>
-    </form>
   </div>
-</div>
 
-<!-- MODAL EDIT POKJA -->
-<div class="modal-overlay" id="modalEditPokja" style="display:none;">
-  <div class="modal">
-    <div class="modal-header">
-      <div class="modal-title">
-        <svg xmlns="http://w3.org" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
-        Edit Pokja
-      </div>
-      <button class="modal-close" onclick="closeModal('modalEditPokja')" aria-label="Tutup">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-      </button>
-    </div>
-    <form method="POST" action="{{ url_for('manage_pokja') }}">
-      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-      <input type="hidden" name="action" value="edit">
-      <input type="hidden" name="pokja_id" id="editPokjaId">
-      <div class="form-group">
-        <label class="form-label">Nama Pokja <span class="req">*</span></label>
-        <input type="text" name="name" id="editPokjaName" required>
-      </div>
-      <div class="form-group">
-        <label class="form-label">Deskripsi</label>
-        <textarea name="description" id="editPokjaDesc" rows="3"></textarea>
-      </div>
-      <div style="display:flex;gap:10px;justify-content:flex-end;">
-        <button type="button" class="btn btn-secondary" onclick="closeModal('modalEditPokja')">Batal</button>
-        <button type="submit" class="btn btn-primary">Simpan Perubahan</button>
-      </div>
-    </form>
-  </div>
 </div>
 
 {% endblock %}
 
 {% block scripts %}
 <script>
-// Fungsi untuk membuka dan memuat data lama ke dalam Modal Edit
+document.addEventListener('DOMContentLoaded', function () {
+  // Animasi progress bar dengan delay kecil
+  setTimeout(function () {
+    document.querySelectorAll('.pkj-fill[data-pct]').forEach(function (el) {
+      el.style.width = el.dataset.pct + '%';
+    });
+  }, 150);
+
+  // Tutup modal klik backdrop
+  document.querySelectorAll('.pkj-overlay').forEach(function (o) {
+    o.addEventListener('click', function (e) {
+      if (e.target === o) closeModal(o.id);
+    });
+  });
+
+  // Tutup modal ESC
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') {
+      document.querySelectorAll('.pkj-overlay').forEach(function (m) {
+        m.style.display = 'none';
+      });
+    }
+  });
+});
+
+function openModal(id) {
+  var m = document.getElementById(id);
+  if (m) { m.style.display = 'flex'; setTimeout(function(){ m.querySelector('input,textarea')?.focus(); }, 80); }
+}
+function closeModal(id) {
+  var m = document.getElementById(id);
+  if (m) m.style.display = 'none';
+}
 function openEditPokja(id, name, desc) {
-  document.getElementById('editPokjaId').value = id;
+  document.getElementById('editPokjaId').value   = id;
   document.getElementById('editPokjaName').value = name;
   document.getElementById('editPokjaDesc').value = desc;
   openModal('modalEditPokja');
 }
-
-// Fungsi konfirmasi hapus data sebelum submit form
-function confirmDelete(formId, pokjaName) {
-  if (confirm("Apakah Anda yakin ingin menghapus pokja '" + pokjaName + "'?")) {
+function confirmDelete(formId, name) {
+  if (confirm('Hapus pokja "' + name + '"?\nSemua data terkait akan ikut terhapus.')) {
     document.getElementById(formId).submit();
-  }
-}
-
-// Fungsi pembantu untuk membuka modal overlay
-function openModal(modalId) {
-  const modal = document.getElementById(modalId);
-  if (modal) {
-    modal.style.display = 'flex';
-  }
-}
-
-// Fungsi pembantu untuk menutup modal overlay
-function closeModal(modalId) {
-  const modal = document.getElementById(modalId);
-  if (modal) {
-    modal.style.display = 'none';
   }
 }
 </script>
