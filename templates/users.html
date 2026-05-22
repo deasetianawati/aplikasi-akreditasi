@@ -119,6 +119,15 @@
                   <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M23 4v6h-6"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
                 </button>
               </form>
+              {% if u['username'] != 'admin' %}
+              <form method="POST" action="{{ url_for('delete_user', uid=u['id']) }}" id="delUser-{{ u['id'] }}" style="display:inline;">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <button type="button" class="btn btn-danger btn-sm" title="Hapus User"
+                        onclick="if(confirm('Hapus user \'{{ u['username']|e }}\' secara permanen?')) document.getElementById('delUser-{{ u['id'] }}').submit()">
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
+                </button>
+              </form>
+              {% endif %}
             </div>
           </td>
         </tr>
@@ -236,6 +245,21 @@
 {% endblock %}
 {% block scripts %}
 <script>
+function openModal(id) {
+  var el = document.getElementById(id);
+  if (el) { el.style.display = 'flex'; document.body.style.overflow = 'hidden'; }
+}
+function closeModal(id) {
+  var el = document.getElementById(id);
+  if (el) { el.style.display = 'none'; document.body.style.overflow = ''; }
+}
+document.addEventListener('DOMContentLoaded', function() {
+  document.querySelectorAll('.modal-overlay').forEach(function(overlay) {
+    overlay.addEventListener('click', function(e) {
+      if (e.target === overlay) closeModal(overlay.id);
+    });
+  });
+});
 function togglePokjaField(role) {
   document.getElementById('addUserPokjaField').style.display = role === 'admin' ? 'none' : '';
 }
