@@ -110,7 +110,13 @@ body {
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   overflow-x: hidden;
+  max-width: 100vw;
 }
+/* Pastikan semua elemen tidak melebihi lebar viewport */
+*, *::before, *::after { max-width: 100%; }
+img, video, iframe { max-width: 100%; height: auto; }
+/* Table tidak force lebar */
+.table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; max-width: 100%; }
 a { color: inherit; text-decoration: none; }
 button { font-family: inherit; cursor: pointer; border: none; background: none; }
 input, select, textarea { font-family: inherit; }
@@ -693,6 +699,8 @@ textarea { resize: vertical; min-height: 90px; }
 .data-table tbody tr:hover { background: var(--surface-2); }
 .data-table tbody tr:last-child { border-bottom: none; }
 .data-table tbody td { padding: 11px 14px; color: var(--text-2); vertical-align: middle; }
+.data-table td[data-label="Aksi"] > div,
+.data-table td[data-label="Aksi"] { overflow: visible; }
 .data-table .td-main { font-weight: 700; color: var(--text-1); }
 .data-table .td-muted { color: var(--text-4); font-size: 12px; }
 .td-clamp { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -776,9 +784,11 @@ textarea { resize: vertical; min-height: 90px; }
   background: var(--surface);
   border-radius: var(--r-2xl);
   padding: 28px;
-  width: min(540px, 95vw);
-  max-height: 92vh;
+  width: min(540px, calc(100vw - 24px));
+  max-height: calc(100vh - 48px);
+  max-height: calc(var(--vh, 1vh) * 100 - 48px);
   overflow-y: auto;
+  overflow-x: hidden;
   box-shadow: var(--shadow-xl);
   animation: pop-in .28s cubic-bezier(.34,1.56,.64,1);
   border: 1px solid var(--border);
@@ -1319,7 +1329,7 @@ textarea { resize: vertical; min-height: 90px; }
 
   .modal { padding: 22px; border-radius: var(--r-xl); }
 
-  .notif-dropdown { width: 300px; right: -50px; }
+  .notif-dropdown { width: calc(100vw - 24px); right: -8px; max-width: 340px; }
 
   .login-page { min-height: 100vh; }
   .login-right { padding: 36px 24px; }
@@ -1359,12 +1369,43 @@ textarea { resize: vertical; min-height: 90px; }
 
 @media (max-width: 480px) {
   .stats-grid { grid-template-columns: 1fr 1fr; gap: 10px; }
-  .stat-card { padding: 14px; }
+  .stat-card { padding: 12px; }
   .stat-val { font-size: 22px; }
-  .stat-icon-box { width: 38px; height: 38px; }
-  .stat-icon-box svg { width: 18px; height: 18px; }
+  .stat-icon-box { width: 36px; height: 36px; }
+  .stat-icon-box svg { width: 17px; height: 17px; }
   .grid-3 { grid-template-columns: 1fr; }
   .login-right { padding: 28px 20px; }
+
+  .content { padding: 10px; }
+
+  /* Tabel aksi: tombol lebih kecil */
+  .btn-sm { padding: 5px 10px; font-size: 11px; }
+
+  /* Modal full-bottom-sheet di layar sangat kecil */
+  .modal-overlay { align-items: flex-end; }
+  .modal {
+    width: 100%;
+    border-bottom-left-radius: 0;
+    border-bottom-right-radius: 0;
+    max-height: 88vh;
+    padding: 16px;
+    animation: slide-up-modal .28s cubic-bezier(.34,1.2,.64,1);
+  }
+  @keyframes slide-up-modal {
+    from { transform: translateY(40px); opacity: 0; }
+    to   { transform: translateY(0);    opacity: 1; }
+  }
+
+  /* Section header tombol full width */
+  .section-header { gap: 8px; }
+  .section-header .btn { font-size: 12.5px; }
+
+  /* Search form stack */
+  .mb-20 form > div { flex-direction: column; }
+  .mb-20 form .btn { width: 100%; justify-content: center; }
+
+  /* Tabel kolom user: kurangi padding avatar */
+  .data-table tbody td { padding: 5px 10px; }
 }
 
 /* ── Touch Optimizations ── */
@@ -1381,8 +1422,12 @@ textarea { resize: vertical; min-height: 90px; }
     padding-bottom: calc(12px + env(safe-area-inset-bottom));
   }
   .topbar {
-    padding-left: calc(24px + env(safe-area-inset-left));
-    padding-right: calc(24px + env(safe-area-inset-right));
+    padding-left: max(14px, env(safe-area-inset-left));
+    padding-right: max(14px, env(safe-area-inset-right));
+  }
+  .content {
+    padding-left: max(14px, env(safe-area-inset-left));
+    padding-right: max(14px, env(safe-area-inset-right));
   }
 }
 
@@ -1409,3 +1454,19 @@ textarea { resize: vertical; min-height: 90px; }
 
 
 
+
+/* ── Viewport height fix untuk iOS Safari ── */
+/* JS di base.html harus set: document.documentElement.style.setProperty('--vh', window.innerHeight * 0.01 + 'px') */
+
+/* ── Prevent zoom on input focus (iOS) ── */
+@media (max-width: 768px) {
+  input[type=text],
+  input[type=password],
+  input[type=email],
+  input[type=number],
+  input[type=search],
+  select,
+  textarea {
+    font-size: 16px !important;
+  }
+}
