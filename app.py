@@ -626,6 +626,25 @@ def create_app() -> Flask:
         flash(f"✅ Password baru: <strong>{new_pw}</strong> (catat sekarang!)", "info")
         return redirect(url_for("manage_users"))
 
+    @app.route("/admin/users/<int:uid>/delete", methods=["POST"])
+    @login_required
+    @admin_required
+    def delete_user(uid):
+        if not _csrf_ok(): abort(403)
+        row = g.db.execute("SELECT username FROM users WHERE id=?", (uid,)).fetchone()
+        if not row:
+            flash("User tidak ditemukan.", "danger")
+            return redirect(url_for("manage_users"))
+        if row["username"] == "admin":
+            flash("Admin utama tidak bisa dihapus.", "warning")
+            return redirect(url_for("manage_users"))
+        g.db.execute("DELETE FROM user_pokja WHERE user_id=?", (uid,))
+        g.db.execute("DELETE FROM users WHERE id=?", (uid,))
+        g.db.commit()
+        _audit("DELETE_USER", g.user["id"], f"deleted={row['username']}")
+        flash(f"\u2705 User '{row['username']}' berhasil dihapus.", "success")
+        return redirect(url_for("manage_users"))
+
     # ── Audit Trail ───────────────────────────────────────────────────────────
     @app.route("/admin/audit")
     @login_required
