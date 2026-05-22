@@ -1,1076 +1,1472 @@
-"""
-Sistem Akreditasi RS
-Developer-grade upgrade: rate limiting, pagination, notifications,
-profile management, activity feed, password change, advanced search.
-"""
-import os, sqlite3, uuid, json, hashlib, secrets, csv, io, logging, math
-from datetime import datetime, timedelta, timezone
-UTC = timezone.utc
-
-
-from pathlib import Path
-from functools import wraps
-from collections import defaultdict
-
-from flask import (Flask, flash, g, redirect, render_template, request,
-                   send_from_directory, session, url_for, jsonify, abort, Response)
-from werkzeug.security import check_password_hash, generate_password_hash
-from werkzeug.utils import secure_filename
-
-BASE_DIR   = Path(__file__).resolve().parent
-DB_PATH    = BASE_DIR / "akreditasi.db"
-UPLOAD_DIR = BASE_DIR / "uploads"
-LOG_DIR    = BASE_DIR / "logs"
-
-ALLOWED_EXTENSIONS = {"pdf","doc","docx","xls","xlsx","ppt","pptx","txt","jpg","jpeg","png","zip","rar"}
-PER_PAGE           = 15
-MAX_LOGIN_ATTEMPTS = 5
-LOCKOUT_SECONDS    = 300   # 5 menit
-
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_DIR / "app.log"),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
-
-# ── In-memory brute force tracker ────────────────────────────────────────────
-_login_attempts: dict = defaultdict(lambda: {"count": 0, "until": 0})
-
-
-def create_app() -> Flask:
-    app = Flask(__name__)
-    app.config.update(
-        SECRET_KEY=os.environ.get("SECRET_KEY", secrets.token_hex(32)),
-        MAX_CONTENT_LENGTH=50 * 1024 * 1024,
-        SESSION_COOKIE_HTTPONLY=True,
-        SESSION_COOKIE_SAMESITE="Lax",
-        PERMANENT_SESSION_LIFETIME=timedelta(hours=8),
-    )
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
-    # ── Jinja2 global: csrf_token() bisa dipanggil dari semua template ──
-    @app.context_processor
-    def inject_csrf():
-        def csrf_token():
-            if "_csrf" not in session:
-                session["_csrf"] = secrets.token_hex(16)
-            return session["_csrf"]
-        return dict(csrf_token=csrf_token)
-
-    @app.before_request
-    def before_request():
-        g.db   = get_db_connection()
-        g.user = get_current_user()
-
-    @app.teardown_request
-    def teardown_request(_exc=None):
-        db = getattr(g, "db", None)
-        if db:
-            db.close()
-
-    @app.after_request
-    def security_headers(resp):
-        resp.headers["X-Content-Type-Options"] = "nosniff"
-        resp.headers["X-Frame-Options"]         = "SAMEORIGIN"
-        resp.headers["X-XSS-Protection"]        = "1; mode=block"
-        resp.headers["Referrer-Policy"]         = "strict-origin-when-cross-origin"
-        return resp
-
-    # ── Auth ──────────────────────────────────────────────────────────────────
-    @app.route("/")
-    @login_required
-    def index():
-        return redirect(url_for("dashboard"))
-
-    @app.route("/login", methods=["GET", "POST"])
-    def login():
-        if g.user:
-            return redirect(url_for("dashboard"))
-        if request.method == "POST":
-            username = request.form.get("username", "").strip().lower()
-            password = request.form.get("password", "")
-            ip       = request.remote_addr
-
-            # Brute force check
-            rec = _login_attempts[ip]
-            now = datetime.now(UTC).timestamp()
-            if rec["count"] >= MAX_LOGIN_ATTEMPTS and now < rec["until"]:
-                remaining = int(rec["until"] - now)
-                flash(f"Terlalu banyak percobaan login. Coba lagi dalam {remaining} detik.", "danger")
-                return render_template("login.html")
-
-            row = g.db.execute(
-                "SELECT id,username,full_name,role,password_hash,active FROM users WHERE lower(username)=?",
-                (username,)).fetchone()
-
-            if not row or not check_password_hash(row["password_hash"], password):
-                rec["count"] += 1
-                if rec["count"] >= MAX_LOGIN_ATTEMPTS:
-                    rec["until"] = now + LOCKOUT_SECONDS
-                _audit("LOGIN_FAILED", None, f"user={username} ip={ip}")
-                flash("Username atau password salah.", "danger")
-                return render_template("login.html")
-
-            if int(row["active"]) != 1:
-                flash("Akun Anda telah dinonaktifkan. Hubungi administrator.", "danger")
-                return render_template("login.html")
-
-            # Reset on success
-            _login_attempts[ip] = {"count": 0, "until": 0}
-            session.permanent = True
-            session["user_id"] = row["id"]
-            session["_csrf"]   = secrets.token_hex(16)
-            _audit("LOGIN_SUCCESS", row["id"], f"ip={ip}")
-            _notify(row["id"], "login", f"Login berhasil dari {ip}")
-            flash(f"Selamat datang kembali, {row['full_name']}! 👋", "success")
-            return redirect(url_for("dashboard"))
-
-        return render_template("login.html")
-
-    @app.route("/logout")
-    @login_required
-    def logout():
-        _audit("LOGOUT", g.user["id"])
-        session.clear()
-        flash("Anda telah keluar. Sampai jumpa! 👋", "info")
-        return redirect(url_for("login"))
-
-    # ── Dashboard ─────────────────────────────────────────────────────────────
-    @app.route("/dashboard")
-    @login_required
-    def dashboard():
-        allowed_ids = _allowed_pokja(g.user["id"], g.user["role"], g.db)
-        stats       = _stats(g.db, allowed_ids, g.user["role"])
-        reminders   = _reminders(g.db)
-        activities  = _recent_activities(g.db, limit=8)
-        notifs      = _get_notifications(g.user["id"], g.db)
-        return render_template("dashboard.html",
-            stats=stats, reminders=reminders,
-            activities=activities, notifs=notifs,
-            csrf=_csrf())
-
-    # ── Dokumen (paginated, advanced search) ──────────────────────────────────
-    @app.route("/dokumen")
-    @login_required
-    def dokumen():
-        search    = request.args.get("q", "").strip()
-        sel_pokja = request.args.get("pokja_id", "all")
-        sel_type  = request.args.get("file_type", "all")
-        sort      = request.args.get("sort", "newest")
-        page      = max(1, int(request.args.get("page", 1)))
-
-        allowed_ids = _allowed_pokja(g.user["id"], g.user["role"], g.db)
-        pokja_rows  = _pokja_user(g.db, allowed_ids, g.user["role"])
-        params, where = [], []
-
-        if g.user["role"] != "admin":
-            if not allowed_ids:
-                return render_template("dokumen.html", files=[], pokja_rows=pokja_rows,
-                    search=search, selected_pokja="all", selected_type="all",
-                    sort=sort, page=1, total_pages=1, total_count=0, csrf=_csrf())
-            ph = ",".join(["?"] * len(allowed_ids))
-            where.append(f"f.pokja_id IN ({ph})")
-            params.extend(allowed_ids)
-
-        if sel_pokja != "all":
-            where.append("f.pokja_id=?"); params.append(int(sel_pokja))
-        if sel_type != "all":
-            where.append("f.file_type=?"); params.append(sel_type.upper())
-        if search:
-            where.append("(f.original_name LIKE ? OR f.description LIKE ? OR f.tags LIKE ?)")
-            like = f"%{search}%"; params.extend([like, like, like])
-
-        wsql  = ("WHERE " + " AND ".join(where)) if where else ""
-        order = {"newest": "f.uploaded_at DESC", "oldest": "f.uploaded_at ASC",
-                 "name": "f.original_name ASC", "size": "f.file_size DESC"}.get(sort, "f.uploaded_at DESC")
-
-        total_count = g.db.execute(f"SELECT COUNT(*) FROM files f {wsql}", tuple(params)).fetchone()[0]
-        total_pages = max(1, math.ceil(total_count / PER_PAGE))
-        page        = min(page, total_pages)
-        offset      = (page - 1) * PER_PAGE
-
-        files = g.db.execute(f"""
-            SELECT f.id, f.original_name, f.description, f.tags, f.uploaded_at,
-                   f.file_size, f.file_type, f.file_hash,
-                   p.name AS pokja_name, p.id AS pokja_id,
-                   u.full_name AS uploader_name,
-                   s.kode AS standar_kode, s.nama AS standar_nama
-            FROM files f
-            INNER JOIN pokja p ON p.id=f.pokja_id
-            INNER JOIN users u ON u.id=f.uploaded_by
-            LEFT JOIN standar s ON s.id=f.standar_id
-            {wsql} ORDER BY {order} LIMIT ? OFFSET ?
-        """, tuple(params) + (PER_PAGE, offset)).fetchall()
-
-        file_types = g.db.execute("SELECT DISTINCT file_type FROM files WHERE file_type!='' ORDER BY file_type").fetchall()
-
-        return render_template("dokumen.html", files=files, pokja_rows=pokja_rows,
-            file_types=file_types, search=search, selected_pokja=sel_pokja,
-            selected_type=sel_type, sort=sort,
-            page=page, total_pages=total_pages, total_count=total_count,
-            csrf=_csrf())
-
-        # ── Upload ────────────────────────────────────────────────────────────────
-    @app.route("/upload", methods=["GET", "POST"])
-    @login_required
-    def upload_file():
-        allowed_ids  = _allowed_pokja(g.user["id"], g.user["role"], g.db)
-        pokja_rows   = _pokja_user(g.db, allowed_ids, g.user["role"])
-        standar_rows = g.db.execute("SELECT id,kode,nama,pokja_id FROM standar ORDER BY kode").fetchall()
-
-        if not pokja_rows:
-            flash("Anda belum memiliki akses ke pokja manapun. Hubungi administrator.", "warning")
-            return redirect(url_for("dashboard"))
-
-        if request.method == "POST":
-            if not _csrf_ok(): abort(403)
-
-            file       = request.files.get("file")
-            desc       = request.form.get("description", "").strip()
-            tags       = request.form.get("tags", "").strip()
-            standar_id = request.form.get("standar_id") or None
-
-            # --- PERBAIKAN VALIDASI POKJA (ANTI-CRASH) ---
-            raw_pokja_id = request.form.get("pokja_id", "").strip()
-
-            if not raw_pokja_id:
-                flash("Pokja wajib dipilih.", "danger")
-                pokja_id = None
-            else:
-                try:
-                    pokja_id = int(raw_pokja_id)
-                except ValueError:
-                    flash("Input Pokja tidak valid.", "danger")
-                    pokja_id = None
-
-            # Evaluasi validasi input sebelum memproses file
-            if not file or not file.filename.strip():
-                flash("File wajib dipilih.", "danger")
-            elif not _allowed_ext(file.filename):
-                flash("Format file tidak diizinkan.", "danger")
-            elif pokja_id is None:
-                # Menahan proses jika validasi pokja_id di atas gagal
-                pass
-            elif g.user["role"] != "admin" and pokja_id not in allowed_ids:
-                flash("Anda tidak memiliki akses ke pokja tersebut.", "danger")
-            else:
-                ext   = file.filename.rsplit(".", 1)[1].lower()
-                sname = f"{uuid.uuid4().hex}.{ext}"
-                fpath = UPLOAD_DIR / sname
-                file.save(fpath)
-                fsize = fpath.stat().st_size
-                fhash = _hash(fpath)
-
-                # --- PERBAIKAN WAKTU (MENGGUNAKAN STANDAR MODERN UTC) ---
-                current_time_utc = datetime.now(UTC).isoformat(timespec="seconds") + "Z"
-
-                g.db.execute("""
-                    INSERT INTO files
-                      (original_name,stored_name,description,tags,pokja_id,standar_id,
-                       uploaded_by,uploaded_at,file_size,file_type,file_hash)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?)
-                """, (secure_filename(file.filename), sname, desc, tags, pokja_id,
-                      standar_id, g.user["id"], current_time_utc,
-                      fsize, ext.upper(), fhash))
-
-                fid = g.db.execute("SELECT last_insert_rowid()").fetchone()[0]
-                g.db.commit()
-                _audit("UPLOAD", g.user["id"], f"file_id={fid} pokja={pokja_id} name={secure_filename(file.filename)}")
-
-                # Notify all admins
-                for adm in g.db.execute("SELECT id FROM users WHERE role='admin' AND active=1").fetchall():
-                    _notify(adm["id"], "upload",
-                        f"{g.user['full_name']} mengupload dokumen baru: {secure_filename(file.filename)}")
-
-                flash("✅ Dokumen berhasil diupload!", "success")
-                return redirect(url_for("dokumen"))
-
-        return render_template("upload.html", pokja_rows=pokja_rows,
-            standar_rows=standar_rows, csrf=_csrf())
-
-
-    # ── Download ──────────────────────────────────────────────────────────────
-    @app.route("/files/<int:fid>/download")
-    @login_required
-    def download_file(fid: int):
-        row = g.db.execute(
-            "SELECT id,original_name,stored_name,pokja_id FROM files WHERE id=?", (fid,)).fetchone()
-        if not row:
-            flash("File tidak ditemukan.", "danger")
-            return redirect(url_for("dokumen"))
-        if g.user["role"] != "admin":
-            if row["pokja_id"] not in _allowed_pokja(g.user["id"], g.user["role"], g.db):
-                _audit("DOWNLOAD_DENIED", g.user["id"], f"file_id={fid}")
-                abort(403)
-        _audit("DOWNLOAD", g.user["id"], f"file_id={fid} name={row['original_name']}")
-        return send_from_directory(UPLOAD_DIR, row["stored_name"],
-            as_attachment=True, download_name=row["original_name"])
-
-    # ── Delete File ───────────────────────────────────────────────────────────
-    @app.route("/files/<int:fid>/delete", methods=["POST"])
-    @login_required
-    @admin_required
-    def delete_file(fid: int):
-        if not _csrf_ok(): abort(403)
-        row = g.db.execute("SELECT stored_name,original_name FROM files WHERE id=?", (fid,)).fetchone()
-        if row:
-            fp = UPLOAD_DIR / row["stored_name"]
-            if fp.exists():
-                fp.unlink()
-            g.db.execute("DELETE FROM files WHERE id=?", (fid,))
-            g.db.commit()
-            _audit("DELETE_FILE", g.user["id"], f"file_id={fid} name={row['original_name']}")
-            flash(f"File '{row['original_name']}' berhasil dihapus.", "success")
-        return redirect(url_for("dokumen"))
-
-    # ── Profile ───────────────────────────────────────────────────────────────
-    @app.route("/profile", methods=["GET", "POST"])
-    @login_required
-    def profile():
-        if request.method == "POST":
-            if not _csrf_ok(): abort(403)
-            action = request.form.get("action", "update_profile")
-
-            if action == "update_profile":
-                full_name = request.form.get("full_name", "").strip()
-                theme     = request.form.get("theme", "light")
-                if len(full_name) < 3:
-                    flash("Nama lengkap minimal 3 karakter.", "danger")
-                else:
-                    g.db.execute("UPDATE users SET full_name=?, theme=? WHERE id=?",
-                        (full_name, theme, g.user["id"]))
-                    g.db.commit()
-                    session["theme"] = theme
-                    _audit("UPDATE_PROFILE", g.user["id"], "updated name/theme")
-                    flash("✅ Profil berhasil diperbarui.", "success")
-
-            elif action == "change_password":
-                old_pw  = request.form.get("current_password", "")
-                new_pw  = request.form.get("new_password", "")
-                conf_pw = request.form.get("confirm_password", "")
-                row     = g.db.execute("SELECT password_hash FROM users WHERE id=?",
-                    (g.user["id"],)).fetchone()
-                if not check_password_hash(row["password_hash"], old_pw):
-                    flash("Password lama tidak sesuai.", "danger")
-                elif new_pw != conf_pw:
-                    flash("Konfirmasi password tidak cocok.", "danger")
-                elif not _strong_pw(new_pw):
-                    flash("Password baru harus minimal 8 karakter, ada huruf besar, kecil, dan angka.", "danger")
-                else:
-                    g.db.execute("UPDATE users SET password_hash=? WHERE id=?",
-                        (generate_password_hash(new_pw), g.user["id"]))
-                    g.db.commit()
-                    _audit("CHANGE_PASSWORD", g.user["id"])
-                    flash("✅ Password berhasil diubah.", "success")
-
-            return redirect(url_for("profile"))
-
-        row = g.db.execute(
-            "SELECT id,username,full_name,role,created_at,theme FROM users WHERE id=?",
-            (g.user["id"],)).fetchone()
-        my_files = g.db.execute(
-            "SELECT COUNT(*) as c FROM files WHERE uploaded_by=?", (g.user["id"],)).fetchone()["c"]
-        my_pokja = g.db.execute(
-            "SELECT p.name FROM user_pokja up JOIN pokja p ON p.id=up.pokja_id WHERE up.user_id=?",
-            (g.user["id"],)).fetchall()
-        stats = {
-            "doc_count":   my_files,
-            "pokja_count": len(my_pokja),
-        }
-        return render_template("profile.html", user=row, my_files=my_files,
-            my_pokja=my_pokja, stats=stats, csrf=_csrf())
-
-    # ── Notifications ─────────────────────────────────────────────────────────
-    @app.route("/notifications/read", methods=["POST"])
-    @login_required
-    def read_notifications():
-        g.db.execute("UPDATE notifications SET is_read=1 WHERE user_id=?", (g.user["id"],))
-        g.db.commit()
-        return jsonify({"ok": True})
-
-    @app.route("/api/notifications")
-    @login_required
-    def api_notifications():
-        notifs = g.db.execute(
-            "SELECT * FROM notifications WHERE user_id=? ORDER BY created_at DESC LIMIT 20",
-            (g.user["id"],)).fetchall()
-        return jsonify({"notifications": [dict(n) for n in notifs]})
-
-    @app.route("/api/notif-count")
-    @login_required
-    def notif_count():
-        c = g.db.execute("SELECT COUNT(*) FROM notifications WHERE user_id=? AND is_read=0",
-            (g.user["id"],)).fetchone()[0]
-        return jsonify({"count": c})
-
-    # ── Admin: Pokja ──────────────────────────────────────────────────────────
-    @app.route("/admin/pokja", methods=["GET", "POST"])
-    @login_required
-    @admin_required
-    def manage_pokja():
-        if request.method == "POST":
-            if not _csrf_ok(): abort(403)
-            action = request.form.get("action", "add")
-            if action == "add":
-                name = request.form.get("name", "").strip()
-                desc = request.form.get("description", "").strip()
-                if len(name) < 2:
-                    flash("Nama pokja minimal 2 karakter.", "danger")
-                elif g.db.execute("SELECT id FROM pokja WHERE lower(name)=lower(?)", (name,)).fetchone():
-                    flash("Nama pokja sudah ada.", "warning")
-                else:
-                    g.db.execute("INSERT INTO pokja(name,description) VALUES(?,?)", (name, desc))
-                    g.db.commit()
-                    _audit("CREATE_POKJA", g.user["id"], f"name={name}")
-                    flash(f"✅ Pokja '{name}' berhasil ditambahkan.", "success")
-            elif action == "delete":
-                pid = int(request.form.get("pokja_id", 0))
-                row = g.db.execute("SELECT name FROM pokja WHERE id=?", (pid,)).fetchone()
-                if row:
-                    g.db.execute("DELETE FROM pokja WHERE id=?", (pid,))
-                    g.db.commit()
-                    _audit("DELETE_POKJA", g.user["id"], f"id={pid}")
-                    flash(f"Pokja dihapus.", "success")
-            elif action == "edit":
-                pid  = int(request.form.get("pokja_id", 0))
-                name = request.form.get("name", "").strip()
-                desc = request.form.get("description", "").strip()
-                if len(name) >= 2:
-                    g.db.execute("UPDATE pokja SET name=?, description=? WHERE id=?", (name, desc, pid))
-                    g.db.commit()
-                    flash("✅ Pokja diperbarui.", "success")
-            return redirect(url_for("manage_pokja"))
-
-        pokja_rows = g.db.execute("""
-            SELECT p.id, p.name, p.description,
-                   COUNT(DISTINCT f.id) AS total_files,
-                   COUNT(DISTINCT up.user_id) AS total_users,
-                   COUNT(DISTINCT s.id) AS total_standar
-            FROM pokja p
-            LEFT JOIN files f ON f.pokja_id=p.id
-            LEFT JOIN user_pokja up ON up.pokja_id=p.id
-            LEFT JOIN standar s ON s.pokja_id=p.id
-            GROUP BY p.id ORDER BY p.name
-        """).fetchall()
-        return render_template("pokja.html", pokja_rows=pokja_rows, csrf=_csrf())
-
-    # ── Admin: Standar ────────────────────────────────────────────────────────
-    @app.route("/admin/standar", methods=["GET", "POST"])
-    @login_required
-    @admin_required
-    def manage_standar():
-        if request.method == "POST":
-            if not _csrf_ok(): abort(403)
-            action = request.form.get("action", "add")
-            if action == "add":
-                kode   = request.form.get("kode", "").strip()
-                nama   = request.form.get("nama", "").strip()
-                pid    = request.form.get("pokja_id") or None
-                target = max(1, int(request.form.get("target_dokumen", 1)))
-                if kode and nama:
-                    if g.db.execute("SELECT id FROM standar WHERE kode=?", (kode,)).fetchone():
-                        flash(f"Kode standar '{kode}' sudah ada.", "warning")
-                    else:
-                        g.db.execute(
-                            "INSERT INTO standar(kode,nama,pokja_id,target_dokumen) VALUES(?,?,?,?)",
-                            (kode, nama, pid, target))
-                        g.db.commit()
-                        flash(f"✅ Standar '{kode}' berhasil ditambahkan.", "success")
-            elif action == "delete":
-                sid = int(request.form.get("standar_id", 0))
-                g.db.execute("DELETE FROM standar WHERE id=?", (sid,))
-                g.db.commit()
-                flash("Standar dihapus.", "success")
-            elif action == "edit":
-                sid    = int(request.form.get("standar_id", 0))
-                nama   = request.form.get("nama", "").strip()
-                pid    = request.form.get("pokja_id") or None
-                target = max(1, int(request.form.get("target_dokumen", 1)))
-                g.db.execute("UPDATE standar SET nama=?, pokja_id=?, target_dokumen=? WHERE id=?",
-                    (nama, pid, target, sid))
-                g.db.commit()
-                flash("✅ Standar diperbarui.", "success")
-            return redirect(url_for("manage_standar"))
-
-        standar_rows = g.db.execute("""
-            SELECT s.id, s.kode, s.nama, s.target_dokumen, s.pokja_id,
-                   p.name AS pokja_name, COUNT(f.id) AS uploaded
-            FROM standar s
-            LEFT JOIN pokja p ON p.id=s.pokja_id
-            LEFT JOIN files f ON f.standar_id=s.id
-            GROUP BY s.id ORDER BY s.kode
-        """).fetchall()
-        pokja_rows = g.db.execute("SELECT id,name FROM pokja ORDER BY name").fetchall()
-        total_s = len(standar_rows)
-        if total_s > 0:
-            avg_compliance = round(sum(
-                min(100, (r["uploaded"] / max(r["target_dokumen"],1) * 100))
-                for r in standar_rows) / total_s)
-        else:
-            avg_compliance = 0
-        full_count     = sum(1 for r in standar_rows if r["uploaded"] >= r["target_dokumen"])
-        critical_count = sum(1 for r in standar_rows if r["uploaded"] == 0)
-        return render_template("standar.html", standar_rows=standar_rows,
-            pokja_rows=pokja_rows, avg_compliance=avg_compliance,
-            full_count=full_count, critical_count=critical_count, csrf=_csrf())
-
-    # ── Admin: Users ──────────────────────────────────────────────────────────
-    @app.route("/admin/users", methods=["GET", "POST"])
-    @login_required
-    @admin_required
-    def manage_users():
-        if request.method == "POST":
-            if not _csrf_ok(): abort(403)
-            username  = request.form.get("username", "").strip().lower()
-            fullname  = request.form.get("full_name", "").strip()
-            role      = request.form.get("role", "pegawai").strip()
-            password  = request.form.get("password", "").strip()
-            sel_pokja = request.form.getlist("pokja_ids")
-            err = []
-            if len(username) < 3: err.append("Username minimal 3 karakter")
-            if len(fullname) < 3: err.append("Nama lengkap minimal 3 karakter")
-            if len(password) < 8: err.append("Password minimal 8 karakter")
-            if not _strong_pw(password): err.append("Password harus ada huruf besar, kecil, angka")
-            if role not in {"admin", "ketua_pokja", "pegawai"}: err.append("Role tidak valid")
-            if g.db.execute("SELECT id FROM users WHERE lower(username)=?", (username,)).fetchone():
-                err.append("Username sudah dipakai")
-            if err:
-                for e in err: flash(e, "danger")
-                return redirect(url_for("manage_users"))
-
-            g.db.execute("""
-                INSERT INTO users(username,full_name,role,password_hash,active,created_at,theme)
-                VALUES(?,?,?,?,1,?,?)
-            """, (username, fullname, role, generate_password_hash(password),
-                 datetime.now(UTC).isoformat(timespec="seconds") + "Z", "light"))
-            uid = g.db.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()["id"]
-            if role != "admin":
-                for pid in sel_pokja:
-                    g.db.execute("INSERT OR IGNORE INTO user_pokja(user_id,pokja_id) VALUES(?,?)",
-                        (uid, int(pid)))
-            g.db.commit()
-            _audit("CREATE_USER", g.user["id"], f"new={username} role={role}")
-            _notify(uid, "system", f"Akun Anda telah dibuat oleh {g.user['full_name']}. Selamat bergabung!")
-            flash(f"✅ User '{username}' berhasil dibuat.", "success")
-            return redirect(url_for("manage_users"))
-
-        search_u = request.args.get("q", "").strip()
-        if search_u:
-            users = g.db.execute(
-                "SELECT id,username,full_name,role,active,created_at FROM users WHERE username LIKE ? OR full_name LIKE ? ORDER BY id",
-                (f"%{search_u}%", f"%{search_u}%")).fetchall()
-        else:
-            users = g.db.execute(
-                "SELECT id,username,full_name,role,active,created_at FROM users ORDER BY id").fetchall()
-
-        pokja_rows = g.db.execute("SELECT id,name FROM pokja ORDER BY name").fetchall()
-        access_map = {}
-        for r in g.db.execute("""
-            SELECT up.user_id, p.id AS pokja_id, p.name AS pokja_name
-            FROM user_pokja up INNER JOIN pokja p ON p.id=up.pokja_id ORDER BY p.name
-        """).fetchall():
-            access_map.setdefault(r["user_id"], []).append(dict(r))
-        return render_template("users.html", users=users, pokja_rows=pokja_rows,
-            access_map=access_map, search_u=search_u, csrf=_csrf())
-
-    @app.route("/admin/users/<int:uid>/toggle", methods=["POST"])
-    @login_required
-    @admin_required
-    def toggle_user(uid):
-        if not _csrf_ok(): abort(403)
-        row = g.db.execute("SELECT username,active FROM users WHERE id=?", (uid,)).fetchone()
-        if not row: flash("User tidak ditemukan.", "danger"); return redirect(url_for("manage_users"))
-        if row["username"] == "admin":
-            flash("Admin utama tidak bisa dinonaktifkan.", "warning")
-            return redirect(url_for("manage_users"))
-        desired = 0 if int(row["active"]) == 1 else 1
-        g.db.execute("UPDATE users SET active=? WHERE id=?", (desired, uid))
-        g.db.commit()
-        _audit("TOGGLE_USER", g.user["id"], f"uid={uid} status={desired}")
-        flash(f"Status user diperbarui menjadi {'Aktif' if desired else 'Nonaktif'}.", "success")
-        return redirect(url_for("manage_users"))
-
-    @app.route("/admin/users/<int:uid>/access", methods=["POST"])
-    @login_required
-    @admin_required
-    def update_user_access(uid):
-        if not _csrf_ok(): abort(403)
-        row = g.db.execute("SELECT role FROM users WHERE id=?", (uid,)).fetchone()
-        if not row or row["role"] == "admin":
-            flash("Aksi tidak valid.", "warning")
-            return redirect(url_for("manage_users"))
-        sel = [int(x) for x in request.form.getlist("pokja_ids")]
-        g.db.execute("DELETE FROM user_pokja WHERE user_id=?", (uid,))
-        for pid in sel:
-            g.db.execute("INSERT OR IGNORE INTO user_pokja(user_id,pokja_id) VALUES(?,?)", (uid, pid))
-        g.db.commit()
-        _audit("UPDATE_ACCESS", g.user["id"], f"uid={uid} pokja={sel}")
-        flash("✅ Hak akses pokja diperbarui.", "success")
-        return redirect(url_for("manage_users"))
-
-    @app.route("/admin/users/<int:uid>/reset-password", methods=["POST"])
-    @login_required
-    @admin_required
-    def reset_password(uid):
-        if not _csrf_ok(): abort(403)
-        new_pw = secrets.token_urlsafe(10)
-        g.db.execute("UPDATE users SET password_hash=? WHERE id=?",
-            (generate_password_hash(new_pw), uid))
-        g.db.commit()
-        _audit("RESET_PASSWORD", g.user["id"], f"uid={uid}")
-        flash(f"✅ Password baru: <strong>{new_pw}</strong> (catat sekarang!)", "info")
-        return redirect(url_for("manage_users"))
-
-    @app.route("/admin/users/<int:uid>/delete", methods=["POST"])
-    @login_required
-    @admin_required
-    def delete_user(uid):
-        if not _csrf_ok(): abort(403)
-        row = g.db.execute("SELECT username FROM users WHERE id=?", (uid,)).fetchone()
-        if not row:
-            flash("User tidak ditemukan.", "danger")
-            return redirect(url_for("manage_users"))
-        if row["username"] == "admin":
-            flash("Admin utama tidak bisa dihapus.", "warning")
-            return redirect(url_for("manage_users"))
-        g.db.execute("DELETE FROM user_pokja WHERE user_id=?", (uid,))
-        g.db.execute("DELETE FROM users WHERE id=?", (uid,))
-        g.db.commit()
-        _audit("DELETE_USER", g.user["id"], f"deleted={row['username']}")
-        flash(f"\u2705 User '{row['username']}' berhasil dihapus.", "success")
-        return redirect(url_for("manage_users"))
-
-    # ── Audit Trail ───────────────────────────────────────────────────────────
-    @app.route("/admin/audit")
-    @login_required
-    @admin_required
-    def audit_trail():
-        page    = max(1, int(request.args.get("page", 1)))
-        action_filter = request.args.get("action", "all")
-        q       = request.args.get("q", "").strip()
-
-        params, where = [], []
-        if action_filter != "all":
-            where.append("al.action LIKE ?"); params.append(f"{action_filter}%")
-        if q:
-            where.append("(al.detail LIKE ? OR u.full_name LIKE ?)")
-            like = f"%{q}%"; params.extend([like, like])
-
-        wsql = ("WHERE " + " AND ".join(where)) if where else ""
-        total = g.db.execute(f"""
-            SELECT COUNT(*) FROM audit_log al LEFT JOIN users u ON u.id=al.user_id {wsql}
-        """, tuple(params)).fetchone()[0]
-        total_pages = max(1, math.ceil(total / PER_PAGE))
-        page = min(page, total_pages)
-        offset = (page - 1) * PER_PAGE
-
-        logs = g.db.execute(f"""
-            SELECT al.id, al.action, al.detail, al.created_at, u.full_name AS user_name
-            FROM audit_log al LEFT JOIN users u ON u.id=al.user_id
-            {wsql} ORDER BY al.created_at DESC LIMIT ? OFFSET ?
-        """, tuple(params) + (PER_PAGE, offset)).fetchall()
-
-        action_types = ["LOGIN", "LOGOUT", "UPLOAD", "DOWNLOAD", "DELETE", "CREATE", "TOGGLE", "UPDATE"]
-        return render_template("audit.html", logs=logs, action_types=action_types,
-            action_filter=action_filter, q=q,
-            page=page, total_pages=total_pages, total=total)
-
-    # ── Analytics API ─────────────────────────────────────────────────────────
-
-    @app.route("/api/analytics")
-    @login_required
-    def api_analytics():
-        # ── 1. GENERATE RENTANG 7 HARI TERAKHIR (1 MINGGU) ──
-        today_dt = datetime.now(UTC).date()
-        date_list = [str(today_dt - timedelta(days=i)) for i in range(6, -1, -1)]
-
-        # Ambil statistik upload dari database filter 7 hari terakhir
-        raw_uploads = g.db.execute("""
-            SELECT SUBSTR(uploaded_at, 1, 10) AS tgl, COUNT(*) AS total
-            FROM files
-            WHERE SUBSTR(uploaded_at, 1, 10) >= DATE('now', '-7 days')
-            GROUP BY tgl
-        """).fetchall()
-
-        db_data = {r["tgl"]: r["total"] for r in raw_uploads}
-        id_months = ["Jan", "Feb", "Mar", "Apr", "Mei", "Jun", "Jul", "Agu", "Sep", "Okt", "Nov", "Des"]
-
-        formatted_chart = []
-        for date_str in date_list:
-            y, m, d = date_str.split("-")
-            month_label = id_months[int(m) - 1]
-            total_upload = db_data.get(date_str, 0)
-
-            # Tampilkan semua label tanggal harian karena rentang waktu pendek
-            display_label = f"{int(d)} {month_label}"
-
-            formatted_chart.append({
-                "tgl": display_label,
-                "total": total_upload
-            })
-
-        # ── 2. DATA ANALISIS KARTU DAN TABEL LAINNYA ──
-        pokja_chart = g.db.execute("""
-            SELECT p.name, COUNT(f.id) AS total
-            FROM pokja p LEFT JOIN files f ON f.pokja_id=p.id
-            GROUP BY p.id ORDER BY total DESC
-        """).fetchall()
-
-        compliance = g.db.execute("""
-            SELECT s.kode, s.nama, s.target_dokumen, COUNT(f.id) AS uploaded, p.name AS pokja_name
-            FROM standar s
-            LEFT JOIN files f ON f.standar_id=s.id
-            LEFT JOIN pokja p ON p.id=s.pokja_id
-            GROUP BY s.id ORDER BY s.kode
-        """).fetchall()
-
-        type_dist = g.db.execute("""
-            SELECT file_type, COUNT(*) AS total FROM files WHERE file_type!='' GROUP BY file_type ORDER BY total DESC
-        """).fetchall()
-
-        weekly = g.db.execute("""
-            SELECT strftime('%w', uploaded_at) AS dow, COUNT(*) AS total
-            FROM files GROUP BY dow ORDER BY dow
-        """).fetchall()
-
-        return jsonify({
-            "uploads_chart": formatted_chart,
-            "pokja_chart":   [dict(r) for r in pokja_chart],
-            "type_dist":     [dict(r) for r in type_dist],
-            "weekly":        [dict(r) for r in weekly],
-            "compliance":    [{
-                "kode": r["kode"], "nama": r["nama"], "pokja": r["pokja_name"],
-                "uploaded": r["uploaded"], "target": r["target_dokumen"],
-                "pct": min(100, round(r["uploaded"] / max(r["target_dokumen"], 1) * 100))
-            } for r in compliance]
-        })
-
-
-
-    # ── Export ────────────────────────────────────────────────────────────────
-    @app.route("/export/csv")
-    @login_required
-    @admin_required
-    def export_csv():
-        rows = g.db.execute("""
-            SELECT f.original_name, f.description, f.tags, f.uploaded_at,
-                   f.file_size, f.file_type, f.file_hash,
-                   p.name AS pokja_name, u.full_name AS uploader,
-                   s.kode AS standar_kode, s.nama AS standar_nama
-            FROM files f
-            INNER JOIN pokja p ON p.id=f.pokja_id
-            INNER JOIN users u ON u.id=f.uploaded_by
-            LEFT JOIN standar s ON s.id=f.standar_id
-            ORDER BY f.uploaded_at DESC
-        """).fetchall()
-        out = io.StringIO()
-        w   = csv.writer(out)
-        w.writerow(["Nama File", "Pokja", "Standar", "Nama Standar", "Deskripsi", "Tags",
-                    "Uploader", "Tgl Upload", "Ukuran (KB)", "Tipe", "Hash"])
-        for r in rows:
-            w.writerow([r["original_name"], r["pokja_name"],
-                r["standar_kode"] or "", r["standar_nama"] or "",
-                r["description"], r["tags"], r["uploader"],
-                r["uploaded_at"][:19].replace("T", " "),
-                round((r["file_size"] or 0) / 1024, 1),
-                r["file_type"], r["file_hash"]])
-        out.seek(0)
-        fname = f"laporan_akreditasi_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
-        _audit("EXPORT_CSV", g.user["id"])
-        return Response(out.getvalue(), mimetype="text/csv",
-            headers={"Content-Disposition": f"attachment; filename={fname}"})
-
-    # ── Error handlers ────────────────────────────────────────────────────────
-    @app.errorhandler(403)
-    def forbidden(e):
-        return render_template("error.html", code=403,
-            msg="Akses ditolak. Anda tidak memiliki izin untuk halaman ini."), 403
-
-    @app.errorhandler(404)
-    def not_found(e):
-        return render_template("error.html", code=404,
-            msg="Halaman tidak ditemukan."), 404
-
-    @app.errorhandler(413)
-    def too_large(e):
-        flash("File terlalu besar. Maksimum 50 MB.", "danger")
-        return redirect(url_for("upload_file"))
-
-    @app.errorhandler(500)
-    def server_error(e):
-        logger.error(f"500: {e}")
-        return render_template("error.html", code=500,
-            msg="Terjadi kesalahan pada server. Silakan coba lagi."), 500
-
-    return app
-
-
-# ── Helpers ────────────────────────────────────────────────────────────────────
-def get_db_connection():
-    c = sqlite3.connect(DB_PATH)
-    c.row_factory = sqlite3.Row
-    c.execute("PRAGMA foreign_keys=ON")
-    c.execute("PRAGMA journal_mode=WAL")
-    return c
-
-def get_current_user():
-    uid = session.get("user_id")
-    if not uid: return None
-    db  = getattr(g, "db", None)
-    if not db: return None
-    row = db.execute(
-        "SELECT id,username,full_name,role,active,theme FROM users WHERE id=?", (uid,)).fetchone()
-    if not row or int(row["active"]) != 1:
-        session.clear(); return None
-    return row
-
-def login_required(func):
-    @wraps(func)
-    def wrapper(*a, **kw):
-        if not g.user: return redirect(url_for("login"))
-        return func(*a, **kw)
-    return wrapper
-
-def admin_required(func):
-    @wraps(func)
-    def wrapper(*a, **kw):
-        if not g.user or g.user["role"] != "admin":
-            flash("Akses ditolak. Halaman ini hanya untuk administrator.", "danger")
-            return redirect(url_for("dashboard"))
-        return func(*a, **kw)
-    return wrapper
-
-def _allowed_ext(fn):
-    return "." in fn and fn.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
-
-def _allowed_pokja(uid, role, db):
-    if role == "admin":
-        return [r["id"] for r in db.execute("SELECT id FROM pokja").fetchall()]
-    return [r["pokja_id"] for r in
-            db.execute("SELECT pokja_id FROM user_pokja WHERE user_id=?", (uid,)).fetchall()]
-
-def _pokja_user(db, allowed_ids, role):
-    if role == "admin":
-        return db.execute("SELECT id,name FROM pokja ORDER BY name").fetchall()
-    if not allowed_ids: return []
-    ph = ",".join(["?"] * len(allowed_ids))
-    return db.execute(f"SELECT id,name FROM pokja WHERE id IN ({ph}) ORDER BY name",
-        tuple(allowed_ids)).fetchall()
-
-def _stats(db, allowed_ids, role):
-    params, where = [], ""
-    if role != "admin" and allowed_ids:
-        ph = ",".join(["?"] * len(allowed_ids))
-        where = f"WHERE pokja_id IN ({ph})"; params = list(allowed_ids)
-    total_files   = db.execute(f"SELECT COUNT(*) FROM files {where}", params).fetchone()[0]
-    total_pokja   = db.execute("SELECT COUNT(*) FROM pokja").fetchone()[0]
-    total_standar = db.execute("SELECT COUNT(*) FROM standar").fetchone()[0]
-    total_users   = db.execute("SELECT COUNT(*) FROM users WHERE active=1").fetchone()[0]
-    rows = db.execute(
-        "SELECT target_dokumen, COUNT(f.id) AS up FROM standar s LEFT JOIN files f ON f.standar_id=s.id GROUP BY s.id"
-    ).fetchall()
-    pct = sum(min(100, r["up"] / max(r["target_dokumen"], 1) * 100) for r in rows) / len(rows) if rows else 0
-    today = db.execute(
-
-        "SELECT COUNT(*) FROM files WHERE SUBSTR(uploaded_at, 1, 10)=DATE('now')", []).fetchone()[0]
-
-    return {
-        "total_files": total_files, "total_pokja": total_pokja,
-        "total_standar": total_standar, "total_users": total_users,
-        "compliance_pct": round(pct, 1), "today_uploads": today
-    }
-
-def _reminders(db):
-    return db.execute("""
-        SELECT s.kode, s.nama, s.target_dokumen, COUNT(f.id) AS uploaded, p.name AS pokja_name
-        FROM standar s
-        LEFT JOIN files f ON f.standar_id=s.id
-        LEFT JOIN pokja p ON p.id=s.pokja_id
-        GROUP BY s.id HAVING uploaded < s.target_dokumen
-        ORDER BY (CAST(uploaded AS REAL)/s.target_dokumen) ASC LIMIT 6
-    """).fetchall()
-
-def _recent_activities(db, limit=8):
-    return db.execute(f"""
-        SELECT al.action, al.detail, al.created_at, u.full_name
-        FROM audit_log al LEFT JOIN users u ON u.id=al.user_id
-        ORDER BY al.created_at DESC LIMIT {limit}
-    """).fetchall()
-
-def _notify(uid, notif_type, message):
-    try:
-        db = get_db_connection()
-        db.execute(
-            "INSERT INTO notifications(user_id,type,message,created_at,is_read) VALUES(?,?,?,?,0)",
-            (uid, notif_type, message, datetime.utcnow().isoformat(timespec="seconds") + "Z"))
-        db.commit(); db.close()
-    except Exception as e:
-        logger.error(f"notify error: {e}")
-
-def _get_notifications(uid, db, limit=10):
-    return db.execute("""
-        SELECT id, type, message, created_at, is_read FROM notifications
-        WHERE user_id=? ORDER BY created_at DESC LIMIT ?
-    """, (uid, limit)).fetchall()
-
-def _audit(action, uid, detail=""):
-    try:
-        db = get_db_connection()
-        db.execute(
-            "INSERT INTO audit_log(action,user_id,detail,created_at) VALUES(?,?,?,?)",
-            (action, uid, detail, datetime.utcnow().isoformat(timespec="seconds") + "Z"))
-        db.commit(); db.close()
-    except Exception as e:
-        logger.error(f"audit error: {e}")
-
-def _hash(path):
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(8192), b""):
-            h.update(chunk)
-    return h.hexdigest()[:16]
-
-def _strong_pw(pw):
-    return (len(pw) >= 8 and any(c.isupper() for c in pw)
-            and any(c.islower() for c in pw) and any(c.isdigit() for c in pw))
-
-def _csrf():    return session.get("_csrf", "")
-def _csrf_ok():
-    # Terima baik nama _csrf (lama) maupun csrf_token (baru dari template)
-    t = (request.form.get("csrf_token")
-         or request.form.get("_csrf")
-         or request.headers.get("X-CSRF-Token"))
-    return t and t == session.get("_csrf")
-
-
-# ── Init DB ────────────────────────────────────────────────────────────────────
-def init_db():
-    db  = sqlite3.connect(DB_PATH)
-    cur = db.cursor()
-    cur.executescript("""
-        PRAGMA foreign_keys=ON;
-        PRAGMA journal_mode=WAL;
-
-        CREATE TABLE IF NOT EXISTS users(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            full_name TEXT NOT NULL,
-            role TEXT NOT NULL,
-            password_hash TEXT NOT NULL,
-            active INTEGER NOT NULL DEFAULT 1,
-            theme TEXT NOT NULL DEFAULT 'light',
-            created_at TEXT NOT NULL);
-
-        CREATE TABLE IF NOT EXISTS pokja(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE NOT NULL,
-            description TEXT DEFAULT '');
-
-        CREATE TABLE IF NOT EXISTS standar(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            kode TEXT UNIQUE NOT NULL,
-            nama TEXT NOT NULL,
-            pokja_id INTEGER REFERENCES pokja(id),
-            target_dokumen INTEGER NOT NULL DEFAULT 1);
-
-        CREATE TABLE IF NOT EXISTS user_pokja(
-            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            pokja_id INTEGER NOT NULL REFERENCES pokja(id) ON DELETE CASCADE,
-            PRIMARY KEY(user_id, pokja_id));
-
-        CREATE TABLE IF NOT EXISTS files(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            original_name TEXT NOT NULL,
-            stored_name TEXT NOT NULL,
-            description TEXT DEFAULT '',
-            tags TEXT DEFAULT '',
-            pokja_id INTEGER NOT NULL REFERENCES pokja(id),
-            standar_id INTEGER REFERENCES standar(id),
-            uploaded_by INTEGER NOT NULL REFERENCES users(id),
-            uploaded_at TEXT NOT NULL,
-            file_size INTEGER DEFAULT 0,
-            file_type TEXT DEFAULT '',
-            file_hash TEXT DEFAULT '');
-
-        CREATE TABLE IF NOT EXISTS audit_log(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            action TEXT NOT NULL,
-            user_id INTEGER REFERENCES users(id),
-            detail TEXT DEFAULT '',
-            created_at TEXT NOT NULL);
-
-        CREATE TABLE IF NOT EXISTS notifications(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            type TEXT NOT NULL DEFAULT 'info',
-            message TEXT NOT NULL,
-            is_read INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL);
-
-        CREATE INDEX IF NOT EXISTS idx_files_pokja    ON files(pokja_id);
-        CREATE INDEX IF NOT EXISTS idx_files_standar  ON files(standar_id);
-        CREATE INDEX IF NOT EXISTS idx_audit_created  ON audit_log(created_at);
-        CREATE INDEX IF NOT EXISTS idx_notif_user     ON notifications(user_id, is_read);
-    """)
-
-    # Default admin
-    if not cur.execute("SELECT id FROM users WHERE username='admin'").fetchone():
-        cur.execute(
-            "INSERT INTO users(username,full_name,role,password_hash,active,theme,created_at) VALUES(?,?,?,?,1,?,?)",
-            ("admin", "Administrator", "admin",
-             generate_password_hash("Admin123!"), "light",
-             datetime.utcnow().isoformat(timespec="seconds") + "Z"))
-
-    # Default pokja
-    for pname, pdesc in [
-        ("Pokja Manajemen", "Manajemen Fasilitas & Keselamatan"),
-        ("Pokja Pelayanan Klinis", "Standar Pelayanan & Asuhan Pasien"),
-        ("Pokja Keselamatan Pasien", "Identifikasi & Insiden Keselamatan"),
-        ("Pokja SDM", "Sumber Daya Manusia & Kompetensi"),
-        ("Pokja Sarpras", "Sarana, Prasarana & Peralatan"),
-        ("Pokja PPI", "Pencegahan & Pengendalian Infeksi"),
-    ]:
-        if not cur.execute("SELECT id FROM pokja WHERE name=?", (pname,)).fetchone():
-            cur.execute("INSERT INTO pokja(name,description) VALUES(?,?)", (pname, pdesc))
-
-    # Default standar SNARS
-    for kode, nama, pokja_name, target in [
-        ("MFK.1", "Manajemen Fasilitas & Keselamatan", "Pokja Manajemen", 3),
-        ("MFK.2", "Program Manajemen Risiko Fasilitas", "Pokja Manajemen", 2),
-        ("MFK.3", "Keselamatan & Keamanan", "Pokja Manajemen", 3),
-        ("PP.1",  "Pelayanan & Asuhan Pasien", "Pokja Pelayanan Klinis", 4),
-        ("PP.2",  "Penilaian Pasien", "Pokja Pelayanan Klinis", 3),
-        ("PP.3",  "Pelayanan Anestesi & Bedah", "Pokja Pelayanan Klinis", 3),
-        ("KP.1",  "Identifikasi Pasien dengan Benar", "Pokja Keselamatan Pasien", 2),
-        ("KP.2",  "Komunikasi Efektif", "Pokja Keselamatan Pasien", 2),
-        ("KP.3",  "Keamanan Obat yang Perlu Diwaspadai", "Pokja Keselamatan Pasien", 3),
-        ("SDM.1", "Perencanaan & Rekrutmen SDM", "Pokja SDM", 2),
-        ("SDM.2", "Kompetensi & Orientasi Staff", "Pokja SDM", 3),
-        ("PPI.1", "Program PPI", "Pokja PPI", 2),
-        ("PPI.2", "Kebersihan Tangan", "Pokja PPI", 2),
-    ]:
-        if not cur.execute("SELECT id FROM standar WHERE kode=?", (kode,)).fetchone():
-            prow = cur.execute("SELECT id FROM pokja WHERE name=?", (pokja_name,)).fetchone()
-            if prow:
-                cur.execute("INSERT INTO standar(kode,nama,pokja_id,target_dokumen) VALUES(?,?,?,?)",
-                    (kode, nama, prow[0], target))
-
-    db.commit()
-    db.close()
-    logger.info("Database initialized — Pro v3.0")
-
-
-init_db()
-app = create_app()
-
-if __name__ == "__main__":
-    host = os.environ.get("HOST", "0.0.0.0")
-    port = int(os.environ.get("PORT", "8000"))
-    debug = os.environ.get("DEBUG", "false").lower() == "true"
-    logger.info(f"AkreditasiRS Pro v3.0 starting on {host}:{port}")
-    app.run(host=host, port=port, debug=debug)
+/* ================================================================
+   AkreditasiRS Pro v5.0 — Premium Design System
+   Mobile-first, Android-optimized, Dark Mode Native
+   ================================================================ */
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap');
+
+:root {
+  --sidebar-w: 272px;
+  --topbar-h: 64px;
+
+  /* Brand Palette — deep teal to cyan */
+  --brand:        #0e7c72;
+  --brand-mid:    #0d9488;
+  --brand-dark:   #0a6560;
+  --brand-light:  #5eead4;
+  --brand-xlight: #f0fdfa;
+  --brand-glow:   rgba(13,148,136,.18);
+  --brand-2:      #0891b2;
+
+  /* Surface */
+  --bg:         #f1f5f9;
+  --surface:    #ffffff;
+  --surface-2:  #f8fafc;
+  --surface-3:  #f1f5f9;
+  --surface-4:  #e8f0fe;
+  --border:     #e2e8f0;
+  --border-2:   #cbd5e1;
+
+  /* Text */
+  --text-1: #0f172a;
+  --text-2: #1e293b;
+  --text-3: #475569;
+  --text-4: #94a3b8;
+  --text-5: #cbd5e1;
+
+  /* Semantic */
+  --red:       #ef4444; --red-mid: #dc2626; --red-dark: #b91c1c;
+  --red-bg:    #fef2f2; --red-border: #fecaca;
+  --yellow:    #f59e0b; --yellow-mid: #d97706;
+  --yellow-bg: #fffbeb; --yellow-border: #fde68a;
+  --green:     #10b981; --green-mid: #059669;
+  --green-bg:  #ecfdf5; --green-border: #a7f3d0;
+  --blue:      #3b82f6; --blue-mid: #2563eb;
+  --blue-bg:   #eff6ff; --blue-border: #bfdbfe;
+  --purple:    #8b5cf6; --purple-mid: #7c3aed;
+  --purple-bg: #f5f3ff; --purple-border: #ddd6fe;
+  --orange:    #f97316; --orange-mid: #ea580c;
+  --orange-bg: #fff7ed; --orange-border: #fed7aa;
+  --cyan:      #06b6d4; --cyan-mid: #0891b2;
+  --cyan-bg:   #ecfeff; --cyan-border: #a5f3fc;
+  --indigo:    #6366f1; --indigo-mid: #4f46e5;
+  --indigo-bg: #eef2ff; --indigo-border: #c7d2fe;
+  --pink:      #ec4899; --pink-mid: #db2777;
+  --pink-bg:   #fdf2f8; --pink-border: #fbcfe8;
+
+  /* Shadows */
+  --shadow-xs: 0 1px 2px rgba(0,0,0,.04);
+  --shadow-sm: 0 2px 4px rgba(0,0,0,.06),0 1px 2px rgba(0,0,0,.04);
+  --shadow:    0 4px 16px rgba(0,0,0,.08),0 2px 4px rgba(0,0,0,.04);
+  --shadow-md: 0 8px 28px rgba(0,0,0,.10),0 3px 8px rgba(0,0,0,.05);
+  --shadow-lg: 0 20px 60px rgba(0,0,0,.13),0 8px 20px rgba(0,0,0,.06);
+  --shadow-xl: 0 32px 80px rgba(0,0,0,.18);
+  --shadow-brand: 0 8px 24px rgba(14,124,114,.28);
+
+  /* Radii */
+  --r-xs: 4px; --r-sm: 8px; --r: 12px;
+  --r-lg: 16px; --r-xl: 20px; --r-2xl: 28px;
+
+  /* Transitions */
+  --t: .18s cubic-bezier(.4,0,.2,1);
+  --t-slow: .35s cubic-bezier(.4,0,.2,1);
+  --t-spring: .4s cubic-bezier(.34,1.56,.64,1);
+}
+
+/* ── Dark Mode ── */
+[data-theme="dark"] {
+  --bg:       #0a0e1a;
+  --surface:  #111827;
+  --surface-2:#161e2e;
+  --surface-3:#1c2537;
+  --surface-4:#1a2642;
+  --border:   #1f2937;
+  --border-2: #283347;
+  --text-1:   #f0f6ff;
+  --text-2:   #cbd5e1;
+  --text-3:   #8b9cb6;
+  --text-4:   #4b5e7a;
+  --text-5:   #2d3f58;
+  --brand-xlight: #0f2d2a;
+  --brand-glow: rgba(13,148,136,.22);
+  --red-bg:    #1a0808; --yellow-bg: #1a1000;
+  --green-bg:  #071a10; --blue-bg:   #060e22;
+  --purple-bg: #100a1f; --orange-bg: #1a0a00;
+  --cyan-bg:   #031218; --indigo-bg: #0a0d24;
+  --pink-bg:   #1a0510;
+  --shadow:    0 4px 16px rgba(0,0,0,.4);
+  --shadow-md: 0 8px 28px rgba(0,0,0,.55);
+  --shadow-lg: 0 20px 60px rgba(0,0,0,.65);
+}
+
+/* ── Reset ── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { scroll-behavior: smooth; }
+body {
+  font-family: 'Plus Jakarta Sans', system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--text-1);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow-x: hidden;
+  max-width: 100vw;
+}
+/* Pastikan semua elemen tidak melebihi lebar viewport */
+*, *::before, *::after { max-width: 100%; }
+img, video, iframe { max-width: 100%; height: auto; }
+/* Table tidak force lebar */
+.table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; max-width: 100%; }
+a { color: inherit; text-decoration: none; }
+button { font-family: inherit; cursor: pointer; border: none; background: none; }
+input, select, textarea { font-family: inherit; }
+img { max-width: 100%; }
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border-2); border-radius: 99px; }
+
+/* ============================================================
+   LAYOUT
+   ============================================================ */
+.layout { display: flex; min-height: 100vh; }
+
+/* ── Sidebar Overlay (mobile) ── */
+.sidebar-overlay {
+  display: none;
+  position: fixed; inset: 0;
+  background: rgba(0,0,0,.55);
+  backdrop-filter: blur(4px);
+  z-index: 190;
+  animation: fade-in .2s ease;
+}
+.sidebar-overlay.show { display: block; }
+
+/* ── SIDEBAR ── */
+.sidebar {
+  width: var(--sidebar-w);
+  min-height: 100vh;
+  background: linear-gradient(180deg, #081c19 0%, #060d0b 60%, #040909 100%);
+  display: flex;
+  flex-direction: column;
+  position: fixed;
+  top: 0; left: 0;
+  z-index: 200;
+  transition: transform var(--t-slow);
+  overflow-y: auto;
+  overflow-x: hidden;
+  border-right: 1px solid rgba(255,255,255,.05);
+  box-shadow: 4px 0 24px rgba(0,0,0,.25);
+}
+
+/* Sidebar decorative gradient line */
+.sidebar::before {
+  content: '';
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 3px;
+  background: linear-gradient(90deg, #0d9488, #06b6d4, #8b5cf6, #0d9488);
+  background-size: 200% 100%;
+  animation: shimmer 4s linear infinite;
+}
+@keyframes shimmer { 0% { background-position: 0% } 100% { background-position: 200% } }
+
+/* ── Brand ── */
+.sidebar-brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 22px 18px 18px;
+  border-bottom: 1px solid rgba(255,255,255,.06);
+  flex-shrink: 0;
+  position: relative;
+}
+.brand-logo {
+  width: 42px; height: 42px;
+  background: linear-gradient(135deg, #0d9488, #0891b2);
+  border-radius: 12px;
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+  box-shadow: 0 4px 14px rgba(13,148,136,.45), 0 0 0 1px rgba(255,255,255,.1);
+  position: relative;
+  overflow: hidden;
+}
+.brand-logo::after {
+  content: '';
+  position: absolute;
+  top: -50%; left: -50%;
+  width: 200%; height: 200%;
+  background: linear-gradient(45deg, transparent 40%, rgba(255,255,255,.12) 50%, transparent 60%);
+  animation: logo-shine 3s ease-in-out infinite;
+}
+@keyframes logo-shine { 0%,100% { transform: translateX(-100%) } 50% { transform: translateX(100%) } }
+.brand-logo svg { color: #fff; width: 20px; height: 20px; position: relative; z-index: 1; }
+.brand-name { font-size: 14px; font-weight: 800; color: #fff; letter-spacing: -.3px; }
+.brand-ver {
+  font-size: 10px;
+  color: rgba(255,255,255,.3);
+  margin-top: 1px;
+  font-family: 'JetBrains Mono', monospace;
+}
+
+/* ── Nav Sections ── */
+.sidebar-section { padding: 14px 10px 4px; }
+.sidebar-label {
+  font-size: 9.5px;
+  font-weight: 800;
+  color: rgba(255,255,255,.18);
+  letter-spacing: .14em;
+  text-transform: uppercase;
+  padding: 4px 10px 4px;
+  margin-bottom: 2px;
+}
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 11px;
+  color: rgba(255,255,255,.5);
+  border-radius: 10px;
+  margin-bottom: 2px;
+  transition: all var(--t);
+  font-size: 13px;
+  font-weight: 500;
+  position: relative;
+  letter-spacing: -.1px;
+}
+.nav-item svg {
+  width: 17px; height: 17px;
+  flex-shrink: 0;
+  opacity: .65;
+  transition: opacity var(--t);
+}
+.nav-item:hover {
+  background: rgba(255,255,255,.08);
+  color: rgba(255,255,255,.9);
+  transform: translateX(2px);
+}
+.nav-item:hover svg { opacity: 1; }
+.nav-item.active {
+  background: linear-gradient(135deg, rgba(13,148,136,.35), rgba(8,145,178,.2));
+  color: #fff;
+  font-weight: 700;
+  box-shadow: 0 2px 12px rgba(13,148,136,.2);
+}
+.nav-item.active svg { opacity: 1; }
+.nav-item.active::before {
+  content: '';
+  position: absolute;
+  left: -1px; top: 20%; height: 60%; width: 3px;
+  background: linear-gradient(180deg, #0d9488, #06b6d4);
+  border-radius: 0 3px 3px 0;
+}
+.nav-badge {
+  margin-left: auto;
+  font-size: 10px; font-weight: 800;
+  background: var(--red);
+  color: #fff;
+  border-radius: 99px;
+  padding: 1px 6px;
+  min-width: 18px;
+  text-align: center;
+  animation: pulse 2s infinite;
+}
+
+/* ── Sidebar Footer ── */
+.sidebar-footer {
+  margin-top: auto;
+  padding: 12px 10px;
+  border-top: 1px solid rgba(255,255,255,.06);
+  flex-shrink: 0;
+}
+.user-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 11px;
+  border-radius: 10px;
+  background: rgba(255,255,255,.06);
+  margin-bottom: 6px;
+  transition: all var(--t);
+  cursor: pointer;
+}
+.user-card:hover { background: rgba(255,255,255,.1); }
+.user-avatar {
+  width: 34px; height: 34px;
+  border-radius: 10px;
+  background: linear-gradient(135deg, #0d9488, #0891b2);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 14px; font-weight: 800; color: #fff;
+  flex-shrink: 0;
+  box-shadow: 0 2px 8px rgba(13,148,136,.3);
+}
+.user-info-name { font-size: 12.5px; font-weight: 700; color: #fff; }
+.user-info-role {
+  font-size: 10px;
+  color: rgba(255,255,255,.35);
+  margin-top: 1px;
+}
+.btn-logout {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 11px;
+  border-radius: 10px;
+  color: rgba(255,255,255,.4);
+  font-size: 12.5px; font-weight: 500;
+  transition: all var(--t);
+  width: 100%;
+}
+.btn-logout svg { width: 14px; height: 14px; }
+.btn-logout:hover {
+  background: rgba(239,68,68,.15);
+  color: #fca5a5;
+}
+
+/* ── MAIN CONTENT ── */
+.main {
+  flex: 1;
+  margin-left: var(--sidebar-w);
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  transition: margin-left var(--t-slow);
+}
+
+/* ── TOPBAR ── */
+.topbar {
+  height: var(--topbar-h);
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  display: flex; align-items: center;
+  padding: 0 24px;
+  gap: 14px;
+  position: sticky; top: 0; z-index: 100;
+  box-shadow: var(--shadow-xs);
+  backdrop-filter: blur(12px);
+  background: rgba(var(--surface-rgb, 255,255,255), .95);
+}
+.btn-menu {
+  display: none;
+  align-items: center; justify-content: center;
+  width: 38px; height: 38px;
+  border-radius: 10px;
+  color: var(--text-3);
+  transition: all var(--t);
+}
+.btn-menu:hover { background: var(--surface-2); color: var(--text-1); }
+.btn-menu svg { width: 20px; height: 20px; }
+.topbar-title {
+  font-size: 16px; font-weight: 800;
+  color: var(--text-1);
+  flex: 1;
+  letter-spacing: -.3px;
+}
+.topbar-right { display: flex; align-items: center; gap: 8px; }
+.icon-btn {
+  width: 36px; height: 36px;
+  border-radius: 10px;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--text-3);
+  background: var(--surface-2);
+  border: 1.5px solid var(--border);
+  transition: all var(--t);
+  position: relative;
+  cursor: pointer;
+}
+.icon-btn svg { width: 17px; height: 17px; }
+.icon-btn:hover {
+  background: var(--brand-xlight);
+  color: var(--brand);
+  border-color: var(--brand-light);
+  transform: scale(1.05);
+}
+.notif-dot {
+  position: absolute; top: 6px; right: 6px;
+  width: 8px; height: 8px;
+  background: var(--red);
+  border-radius: 50%;
+  border: 2px solid var(--surface);
+  animation: pulse 2s infinite;
+}
+@keyframes pulse { 0%,100%{transform:scale(1)} 50%{transform:scale(1.25)} }
+.role-pill {
+  display: inline-flex; align-items: center;
+  padding: 4px 12px;
+  border-radius: 99px;
+  font-size: 11px; font-weight: 800;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+}
+.role-admin { background: linear-gradient(135deg,#0f766e,#0891b2); color: #fff; box-shadow: 0 2px 8px rgba(14,124,114,.3); }
+.role-ketua_pokja { background: var(--purple-bg); color: var(--purple-mid); border: 1.5px solid var(--purple-border); }
+.role-pegawai { background: var(--blue-bg); color: var(--blue-mid); border: 1.5px solid var(--blue-border); }
+
+/* ── Content ── */
+.content { flex: 1; padding: 24px; }
+
+/* ── Notifications Dropdown ── */
+.notif-dropdown {
+  position: absolute; top: calc(100% + 10px); right: 0;
+  width: 360px;
+  background: var(--surface);
+  border: 1.5px solid var(--border);
+  border-radius: var(--r-xl);
+  box-shadow: var(--shadow-lg);
+  z-index: 400; display: none;
+  overflow: hidden;
+  animation: pop-in .2s ease;
+}
+.notif-dropdown.open { display: block; }
+.notif-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-2);
+}
+.notif-title { font-size: 13.5px; font-weight: 800; }
+.notif-item {
+  display: flex; gap: 10px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  transition: background var(--t);
+}
+.notif-item:hover { background: var(--surface-2); }
+.notif-item.unread { background: var(--brand-xlight); }
+.notif-icon-box {
+  width: 34px; height: 34px;
+  border-radius: 50%;
+  background: var(--brand-xlight);
+  color: var(--brand);
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+}
+.notif-icon-box svg { width: 14px; height: 14px; }
+.notif-msg { font-size: 12.5px; color: var(--text-1); line-height: 1.4; }
+.notif-time { font-size: 10.5px; color: var(--text-4); margin-top: 3px; }
+
+/* ============================================================
+   COMPONENTS
+   ============================================================ */
+
+/* ── Cards ── */
+.card {
+  background: var(--surface);
+  border-radius: var(--r-lg);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-xs);
+  overflow: hidden;
+  transition: box-shadow var(--t);
+}
+.card:hover { box-shadow: var(--shadow-sm); }
+.card-body { padding: 20px; }
+.card-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-2);
+}
+.card-title {
+  font-size: 13.5px; font-weight: 800;
+  color: var(--text-1);
+  display: flex; align-items: center; gap: 8px;
+  letter-spacing: -.2px;
+}
+.card-title svg { width: 16px; height: 16px; color: var(--brand); }
+
+/* ── Stat Cards — Dashboard ── */
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 16px;
+  margin-bottom: 24px;
+}
+.stat-card {
+  background: var(--surface);
+  border-radius: var(--r-lg);
+  border: 1px solid var(--border);
+  padding: 20px;
+  position: relative;
+  overflow: hidden;
+  transition: all var(--t);
+  box-shadow: var(--shadow-xs);
+  cursor: default;
+}
+.stat-card::before {
+  content: '';
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 3px;
+  border-radius: var(--r-lg) var(--r-lg) 0 0;
+}
+.stat-card::after {
+  content: '';
+  position: absolute;
+  top: -20px; right: -20px;
+  width: 100px; height: 100px;
+  border-radius: 50%;
+  opacity: .07;
+}
+.stat-card:hover {
+  transform: translateY(-3px);
+  box-shadow: var(--shadow-md);
+}
+.stat-card.c-blue::before { background: linear-gradient(90deg,var(--blue),var(--indigo)); }
+.stat-card.c-blue::after  { background: var(--blue); }
+.stat-card.c-green::before { background: linear-gradient(90deg,var(--green),var(--cyan)); }
+.stat-card.c-green::after  { background: var(--green); }
+.stat-card.c-purple::before { background: linear-gradient(90deg,var(--purple),var(--pink)); }
+.stat-card.c-purple::after  { background: var(--purple); }
+.stat-card.c-yellow::before { background: linear-gradient(90deg,var(--yellow),var(--orange)); }
+.stat-card.c-yellow::after  { background: var(--yellow); }
+.stat-card.c-orange::before { background: linear-gradient(90deg,var(--orange),var(--red)); }
+.stat-card.c-orange::after  { background: var(--orange); }
+.stat-card.c-red::before { background: linear-gradient(90deg,var(--red),var(--pink)); }
+.stat-card.c-red::after  { background: var(--red); }
+.stat-card.c-brand::before { background: linear-gradient(90deg,var(--brand-mid),var(--brand-2)); }
+.stat-card.c-brand::after  { background: var(--brand-mid); }
+.stat-top {
+  display: flex; align-items: flex-start; justify-content: space-between;
+}
+.stat-icon-box {
+  width: 46px; height: 46px;
+  border-radius: 12px;
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+}
+.stat-icon-box svg { width: 22px; height: 22px; }
+.stat-card.c-blue .stat-icon-box   { background:var(--blue-bg);color:var(--blue-mid); }
+.stat-card.c-green .stat-icon-box  { background:var(--green-bg);color:var(--green-mid); }
+.stat-card.c-purple .stat-icon-box { background:var(--purple-bg);color:var(--purple-mid); }
+.stat-card.c-yellow .stat-icon-box { background:var(--yellow-bg);color:var(--yellow-mid); }
+.stat-card.c-orange .stat-icon-box { background:var(--orange-bg);color:var(--orange-mid); }
+.stat-card.c-red .stat-icon-box    { background:var(--red-bg);color:var(--red-mid); }
+.stat-card.c-brand .stat-icon-box  { background:var(--brand-xlight);color:var(--brand); }
+.stat-val {
+  font-size: 30px; font-weight: 800;
+  color: var(--text-1);
+  line-height: 1.1;
+  letter-spacing: -1px;
+  font-variant-numeric: tabular-nums;
+}
+.stat-lbl { font-size: 12.5px; font-weight: 700; color: var(--text-2); margin-top: 4px; }
+.stat-sub { font-size: 11px; color: var(--text-4); margin-top: 2px; }
+.stat-progress {
+  height: 5px; background: var(--border);
+  border-radius: 99px; margin-top: 14px; overflow: hidden;
+}
+.stat-progress-fill {
+  height: 100%; border-radius: 99px;
+  background: var(--green);
+  transition: width .9s cubic-bezier(.4,0,.2,1);
+}
+.stat-trend {
+  display: inline-flex; align-items: center; gap: 3px;
+  font-size: 11px; font-weight: 700;
+  padding: 2px 7px;
+  border-radius: 99px;
+  margin-top: 4px;
+}
+.stat-trend.up { background: var(--green-bg); color: var(--green-mid); }
+.stat-trend.down { background: var(--red-bg); color: var(--red-mid); }
+.stat-trend svg { width: 11px; height: 11px; }
+
+/* ── Grids ── */
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+.grid-3 { display: grid; grid-template-columns: repeat(3,1fr); gap: 20px; }
+.grid-70-30 { display: grid; grid-template-columns: 1fr 320px; gap: 20px; }
+.mb-16{margin-bottom:16px} .mb-20{margin-bottom:20px}
+.mb-24{margin-bottom:24px} .mb-28{margin-bottom:28px}
+
+/* ── Buttons ── */
+.btn {
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 9px 18px;
+  border-radius: 10px;
+  font-size: 13px; font-weight: 700;
+  cursor: pointer;
+  transition: all var(--t);
+  border: 1.5px solid transparent;
+  white-space: nowrap;
+  line-height: 1.4;
+  letter-spacing: -.1px;
+}
+.btn svg { width: 15px; height: 15px; flex-shrink: 0; }
+.btn:active { transform: scale(.96); }
+.btn-primary {
+  background: var(--brand);
+  color: #fff;
+  border-color: var(--brand-dark);
+  box-shadow: 0 2px 10px rgba(14,124,114,.3);
+}
+.btn-primary:hover {
+  background: var(--brand-dark);
+  box-shadow: var(--shadow-brand);
+  transform: translateY(-1px);
+}
+.btn-secondary {
+  background: var(--surface);
+  color: var(--text-2);
+  border-color: var(--border-2);
+}
+.btn-secondary:hover {
+  background: var(--surface-2);
+  border-color: var(--brand);
+  color: var(--brand);
+}
+.btn-ghost {
+  background: transparent;
+  color: var(--text-3);
+  border-color: transparent;
+}
+.btn-ghost:hover { background: var(--surface-2); color: var(--text-1); }
+.btn-danger {
+  background: var(--red);
+  color: #fff;
+  border-color: var(--red-mid);
+  box-shadow: 0 2px 10px rgba(239,68,68,.25);
+}
+.btn-danger:hover { background: var(--red-dark); }
+.btn-success {
+  background: var(--green);
+  color: #fff;
+  border-color: var(--green-mid);
+}
+.btn-success:hover { background: var(--green-mid); }
+.btn-sm { padding: 6px 13px; font-size: 12px; border-radius: 8px; }
+.btn-lg { padding: 11px 22px; font-size: 14.5px; }
+.btn-full { width: 100%; justify-content: center; }
+.btn-icon { width: 34px; height: 34px; padding: 0; justify-content: center; border-radius: 9px; }
+
+/* ── Forms ── */
+.form-group { margin-bottom: 16px; }
+.form-label {
+  display: block;
+  font-size: 12.5px; font-weight: 700;
+  color: var(--text-2); margin-bottom: 6px;
+  letter-spacing: -.1px;
+}
+.form-label .req { color: var(--red); margin-left: 2px; }
+.form-hint { font-size: 11px; color: var(--text-4); margin-top: 4px; }
+input[type=text],input[type=password],input[type=email],input[type=number],input[type=search],select,textarea {
+  width: 100%;
+  padding: 9px 13px;
+  border: 1.5px solid var(--border-2);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--text-1);
+  font-size: 13.5px;
+  transition: all var(--t);
+  outline: none;
+  -webkit-appearance: none;
+}
+input:focus,select:focus,textarea:focus {
+  border-color: var(--brand);
+  box-shadow: 0 0 0 4px var(--brand-glow);
+}
+input::placeholder,textarea::placeholder { color: var(--text-4); }
+textarea { resize: vertical; min-height: 90px; }
+.input-with-icon { position: relative; }
+.input-icon {
+  position: absolute; left: 11px; top: 50%;
+  transform: translateY(-50%);
+  color: var(--text-4); pointer-events: none;
+  display: flex; align-items: center;
+}
+.input-icon svg { width: 15px; height: 15px; }
+.input-with-icon input { padding-left: 36px; }
+.form-row-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.form-row-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 14px; }
+.col-span-2{grid-column:span 2} .col-span-3{grid-column:span 3}
+
+/* ── Tables ── */
+.table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+.data-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.data-table thead th {
+  background: var(--surface-2);
+  padding: 11px 14px;
+  text-align: left;
+  font-size: 11px; font-weight: 800;
+  color: var(--text-3);
+  text-transform: uppercase;
+  letter-spacing: .07em;
+  border-bottom: 2px solid var(--border);
+  white-space: nowrap;
+}
+.data-table tbody tr {
+  border-bottom: 1px solid var(--border);
+  transition: background var(--t);
+}
+.data-table tbody tr:hover { background: var(--surface-2); }
+.data-table tbody tr:last-child { border-bottom: none; }
+.data-table tbody td { padding: 11px 14px; color: var(--text-2); vertical-align: middle; }
+.data-table td[data-label="Aksi"] > div,
+.data-table td[data-label="Aksi"] { overflow: visible; }
+.data-table .td-main { font-weight: 700; color: var(--text-1); }
+.data-table .td-muted { color: var(--text-4); font-size: 12px; }
+.td-clamp { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ── Badges ── */
+.badge {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 3px 9px;
+  border-radius: 99px;
+  font-size: 11px; font-weight: 700;
+  white-space: nowrap;
+}
+.badge svg { width: 10px; height: 10px; }
+.badge-teal   {background:var(--brand-xlight);color:var(--brand-dark);border:1px solid var(--brand-light);}
+.badge-blue   {background:var(--blue-bg);color:var(--blue-mid);border:1px solid var(--blue-border);}
+.badge-green  {background:var(--green-bg);color:var(--green-mid);border:1px solid var(--green-border);}
+.badge-red    {background:var(--red-bg);color:var(--red-mid);border:1px solid var(--red-border);}
+.badge-yellow {background:var(--yellow-bg);color:var(--yellow-mid);border:1px solid var(--yellow-border);}
+.badge-purple {background:var(--purple-bg);color:var(--purple-mid);border:1px solid var(--purple-border);}
+.badge-orange {background:var(--orange-bg);color:var(--orange-mid);border:1px solid var(--orange-border);}
+.badge-gray   {background:var(--surface-3);color:var(--text-3);border:1px solid var(--border);}
+.badge-cyan   {background:var(--cyan-bg);color:var(--cyan-mid);border:1px solid var(--cyan-border);}
+.badge-indigo {background:var(--indigo-bg);color:var(--indigo-mid);border:1px solid var(--indigo-border);}
+.badge-pink   {background:var(--pink-bg);color:var(--pink-mid);border:1px solid var(--pink-border);}
+
+/* ── File type icons ── */
+.file-icon {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 32px; height: 32px;
+  border-radius: 8px;
+  font-size: 9px; font-weight: 900;
+  flex-shrink: 0;
+  letter-spacing: 0;
+}
+.fi-pdf  {background:#fee2e2;color:#b91c1c}
+.fi-doc,.fi-docx {background:#dbeafe;color:#1d4ed8}
+.fi-xls,.fi-xlsx {background:#d1fae5;color:#065f46}
+.fi-ppt,.fi-pptx {background:#ffedd5;color:#c2410c}
+.fi-jpg,.fi-jpeg,.fi-png {background:#f3e8ff;color:#7c3aed}
+.fi-zip,.fi-rar  {background:#fef3c7;color:#b45309}
+.fi-txt  {background:#f0f9ff;color:#0369a1}
+.fi-def  {background:var(--surface-2);color:var(--text-3)}
+
+/* ── Alerts ── */
+.alert {
+  display: flex; align-items: flex-start; gap: 10px;
+  padding: 13px 16px;
+  border-radius: 12px;
+  font-size: 13px;
+  margin-bottom: 14px;
+  animation: slide-down .25s ease;
+  border: 1px solid;
+}
+@keyframes slide-down { from{opacity:0;transform:translateY(-10px)} to{opacity:1;transform:none} }
+.alert svg { width: 16px; height: 16px; flex-shrink: 0; margin-top: 2px; }
+.alert-body { flex: 1; line-height: 1.5; }
+.alert-close {
+  background: none; border: none; cursor: pointer;
+  opacity: .5; margin-left: auto; flex-shrink: 0;
+  color: inherit; display: flex; align-items: center;
+  transition: opacity var(--t);
+}
+.alert-close:hover { opacity: 1; }
+.alert-close svg { width: 15px; height: 15px; }
+.alert-success {background:var(--green-bg);color:#065f46;border-color:var(--green-border);border-left:4px solid var(--green);}
+.alert-danger  {background:var(--red-bg);color:#7f1d1d;border-color:var(--red-border);border-left:4px solid var(--red);}
+.alert-warning {background:var(--yellow-bg);color:#78350f;border-color:var(--yellow-border);border-left:4px solid var(--yellow);}
+.alert-info    {background:var(--blue-bg);color:#1e3a5f;border-color:var(--blue-border);border-left:4px solid var(--blue);}
+
+/* ── Modal ── */
+.modal-overlay {
+  position: fixed; inset: 0;
+  background: rgba(0,0,0,.6);
+  backdrop-filter: blur(6px);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 500;
+  animation: fade-in .2s ease;
+}
+@keyframes fade-in { from{opacity:0} to{opacity:1} }
+.modal {
+  background: var(--surface);
+  border-radius: var(--r-2xl);
+  padding: 28px;
+  width: min(540px, calc(100vw - 24px));
+  max-height: calc(100vh - 48px);
+  max-height: calc(var(--vh, 1vh) * 100 - 48px);
+  overflow-y: auto;
+  overflow-x: hidden;
+  box-shadow: var(--shadow-xl);
+  animation: pop-in .28s cubic-bezier(.34,1.56,.64,1);
+  border: 1px solid var(--border);
+}
+@keyframes pop-in { from{opacity:0;transform:scale(.9) translateY(16px)} to{opacity:1;transform:none} }
+.modal-header {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 22px;
+}
+.modal-title {
+  font-size: 16px; font-weight: 800;
+  color: var(--text-1);
+  display: flex; align-items: center; gap: 8px;
+}
+.modal-title svg { width: 18px; height: 18px; color: var(--brand); }
+.modal-close {
+  background: var(--surface-2);
+  border: 1.5px solid var(--border);
+  width: 32px; height: 32px;
+  border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer; color: var(--text-3);
+  transition: all var(--t);
+}
+.modal-close svg { width: 15px; height: 15px; }
+.modal-close:hover { background: var(--red-bg); color: var(--red); border-color: var(--red-border); }
+
+/* ── Login ── */
+.login-page {
+  min-height: 100vh;
+  display: flex;
+  position: relative;
+  overflow: hidden;
+}
+.login-left {
+  flex: 1;
+  background: linear-gradient(145deg, #071c19 0%, #080d20 50%, #060c1a 100%);
+  display: flex; flex-direction: column;
+  align-items: flex-start; justify-content: center;
+  padding: 60px;
+  position: relative;
+  z-index: 1;
+  overflow: hidden;
+}
+.login-left::before {
+  content: '';
+  position: absolute;
+  width: 500px; height: 500px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(13,148,136,.25), transparent 70%);
+  top: -150px; right: -100px; z-index: 0;
+}
+.login-left::after {
+  content: '';
+  position: absolute;
+  width: 350px; height: 350px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(99,102,241,.15), transparent 70%);
+  bottom: -80px; left: 40px; z-index: 0;
+}
+/* Animated grid lines in login bg */
+.login-grid {
+  position: absolute; inset: 0; z-index: 0;
+  background-image:
+    linear-gradient(rgba(255,255,255,.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,255,255,.03) 1px, transparent 1px);
+  background-size: 40px 40px;
+}
+.login-right {
+  width: 460px;
+  background: var(--surface);
+  display: flex; align-items: center; justify-content: center;
+  padding: 52px 48px;
+  box-shadow: -24px 0 80px rgba(0,0,0,.18);
+}
+.login-brand {
+  display: flex; align-items: center; gap: 13px;
+  margin-bottom: 52px;
+  position: relative; z-index: 1;
+}
+.login-brand-logo {
+  width: 50px; height: 50px;
+  background: linear-gradient(135deg, #0d9488, #0891b2);
+  border-radius: 14px;
+  display: flex; align-items: center; justify-content: center;
+  box-shadow: 0 6px 20px rgba(13,148,136,.4);
+}
+.login-brand-logo svg { width: 26px; height: 26px; color: #fff; }
+.login-brand-name { font-size: 21px; font-weight: 900; color: #fff; letter-spacing: -.5px; }
+.login-brand-sub { font-size: 11px; color: rgba(255,255,255,.35); margin-top: 2px; }
+.login-hero { position: relative; z-index: 1; }
+.login-hero-title { font-size: 36px; font-weight: 900; color: #fff; line-height: 1.1; margin-bottom: 16px; letter-spacing: -1px; }
+.login-hero-title span { color: var(--brand-light); }
+.login-hero-sub { font-size: 15px; color: rgba(255,255,255,.5); line-height: 1.75; max-width: 360px; }
+.login-features {
+  display: flex; flex-direction: column; gap: 16px;
+  margin-top: 48px;
+  position: relative; z-index: 1;
+}
+.login-feat { display: flex; align-items: center; gap: 13px; }
+.login-feat-icon {
+  width: 38px; height: 38px;
+  background: rgba(255,255,255,.08);
+  border: 1px solid rgba(255,255,255,.1);
+  border-radius: 10px;
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+}
+.login-feat-icon svg { width: 17px; height: 17px; color: var(--brand-light); }
+.login-feat-text { font-size: 14px; color: rgba(255,255,255,.7); font-weight: 500; }
+.login-form-wrap { width: 100%; }
+.login-form-title { font-size: 26px; font-weight: 900; color: var(--text-1); margin-bottom: 4px; letter-spacing: -.5px; }
+.login-form-sub { font-size: 13.5px; color: var(--text-4); margin-bottom: 30px; }
+.pw-wrap { position: relative; }
+.pw-wrap input { padding-right: 42px; }
+.pw-toggle {
+  position: absolute; right: 11px; top: 50%;
+  transform: translateY(-50%);
+  color: var(--text-4); transition: color var(--t);
+  display: flex; align-items: center;
+  background: none; border: none; cursor: pointer; padding: 0;
+}
+.pw-toggle svg { width: 16px; height: 16px; }
+.pw-toggle:hover { color: var(--text-2); }
+.login-divider {
+  display: flex; align-items: center; gap: 12px;
+  color: var(--text-4); font-size: 12px;
+  margin: 20px 0;
+}
+.login-divider::before, .login-divider::after {
+  content: ''; flex: 1; height: 1px;
+  background: var(--border);
+}
+.login-demo {
+  padding: 12px 14px;
+  background: var(--surface-2);
+  border: 1.5px solid var(--border);
+  border-radius: 10px;
+  font-size: 12px; color: var(--text-3);
+  text-align: center; margin-top: 18px;
+  line-height: 1.6;
+}
+.login-demo strong {
+  color: var(--brand);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13px;
+}
+.login-security {
+  display: flex; align-items: center; gap: 5px;
+  font-size: 11px; color: var(--text-4);
+  justify-content: center; margin-top: 16px;
+}
+.login-security svg { width: 12px; height: 12px; }
+
+/* ── Dashboard: Reminder Cards ── */
+.reminder-list { display: flex; flex-direction: column; gap: 10px; padding: 16px; }
+.reminder-card {
+  padding: 14px 16px;
+  border-radius: 12px;
+  border: 1.5px solid;
+  transition: all var(--t);
+  cursor: pointer;
+}
+.reminder-card:hover { transform: translateX(4px); box-shadow: var(--shadow-sm); }
+.reminder-card.rem-red {
+  background: var(--red-bg);
+  border-color: var(--red-border);
+}
+.reminder-card.rem-yellow {
+  background: var(--yellow-bg);
+  border-color: var(--yellow-border);
+}
+.reminder-card.rem-green {
+  background: var(--green-bg);
+  border-color: var(--green-border);
+}
+.rem-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 3px; }
+.rem-kode { font-weight: 900; font-size: 13px; font-family: 'JetBrains Mono', monospace; }
+.rem-count { font-size: 12px; font-weight: 800; }
+.rem-nama { font-size: 12.5px; font-weight: 600; margin-bottom: 2px; }
+.rem-pokja { font-size: 10.5px; color: var(--text-4); margin-bottom: 8px; }
+.rem-bar { height: 5px; background: rgba(0,0,0,.1); border-radius: 99px; overflow: hidden; }
+.rem-bar-fill { height: 100%; border-radius: 99px; opacity: .65; transition: width .7s ease; }
+
+/* ── Activity Feed ── */
+.activity-list { padding: 4px 0; }
+.activity-item {
+  display: flex; align-items: flex-start; gap: 12px;
+  padding: 11px 20px;
+  border-bottom: 1px solid var(--border);
+  transition: background var(--t);
+}
+.activity-item:last-child { border-bottom: none; }
+.activity-item:hover { background: var(--surface-2); }
+.act-icon {
+  width: 34px; height: 34px;
+  border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0; margin-top: 1px;
+}
+.act-icon svg { width: 15px; height: 15px; }
+.act-icon.login    {background:var(--green-bg);color:var(--green-mid);}
+.act-icon.upload   {background:var(--blue-bg);color:var(--blue-mid);}
+.act-icon.download {background:var(--purple-bg);color:var(--purple-mid);}
+.act-icon.delete   {background:var(--red-bg);color:var(--red-mid);}
+.act-icon.create   {background:var(--green-bg);color:var(--green-mid);}
+.act-icon.toggle   {background:var(--yellow-bg);color:var(--yellow-mid);}
+.act-icon.export   {background:var(--cyan-bg);color:var(--cyan-mid);}
+.act-icon.default  {background:var(--surface-2);color:var(--text-3);}
+.act-content { flex: 1; min-width: 0; }
+.act-title { font-size: 12.5px; color: var(--text-1); line-height: 1.45; }
+.act-title strong { font-weight: 800; }
+.act-meta { font-size: 11px; color: var(--text-4); margin-top: 2px; font-family: 'JetBrains Mono', monospace; }
+.act-time { font-size: 10.5px; color: var(--text-4); flex-shrink: 0; white-space: nowrap; padding-top: 3px; }
+
+/* ── Pagination ── */
+.pagination {
+  display: flex; align-items: center; justify-content: center;
+  gap: 6px; padding: 16px 0;
+}
+.page-btn {
+  width: 34px; height: 34px;
+  border-radius: 9px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 13px; font-weight: 700;
+  color: var(--text-3);
+  border: 1.5px solid var(--border);
+  background: var(--surface);
+  transition: all var(--t);
+  cursor: pointer;
+}
+.page-btn:hover { border-color: var(--brand); color: var(--brand); }
+.page-btn.active {
+  background: var(--brand);
+  color: #fff;
+  border-color: var(--brand);
+  box-shadow: 0 2px 8px rgba(14,124,114,.3);
+}
+.page-btn:disabled { opacity: .4; cursor: not-allowed; }
+
+/* ── Upload Dropzone ── */
+.dropzone {
+  border: 2px dashed var(--border-2);
+  border-radius: var(--r-lg);
+  padding: 40px;
+  text-align: center;
+  cursor: pointer;
+  transition: all var(--t);
+  background: var(--surface-2);
+  position: relative;
+}
+.dropzone:hover, .dropzone.dragover {
+  border-color: var(--brand);
+  background: var(--brand-xlight);
+}
+.dropzone-icon {
+  width: 60px; height: 60px;
+  border-radius: 16px;
+  background: var(--surface);
+  border: 2px solid var(--border);
+  display: flex; align-items: center; justify-content: center;
+  margin: 0 auto 16px;
+  transition: all var(--t);
+}
+.dropzone:hover .dropzone-icon, .dropzone.dragover .dropzone-icon {
+  border-color: var(--brand);
+  color: var(--brand);
+  transform: scale(1.08);
+}
+.dropzone-icon svg { width: 28px; height: 28px; color: var(--text-3); }
+.dropzone-title { font-size: 15px; font-weight: 700; color: var(--text-1); }
+.dropzone-sub { font-size: 12.5px; color: var(--text-4); margin-top: 4px; }
+.dropzone-types {
+  display: flex; flex-wrap: wrap; justify-content: center;
+  gap: 6px; margin-top: 14px;
+}
+.dropzone-type-pill {
+  padding: 2px 9px;
+  border-radius: 99px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  font-size: 11px; font-weight: 700;
+  color: var(--text-3);
+}
+
+/* ── Empty State ── */
+.empty-state {
+  padding: 48px 24px;
+  text-align: center;
+}
+.empty-state-icon {
+  width: 64px; height: 64px;
+  border-radius: 16px;
+  background: var(--surface-2);
+  border: 1.5px solid var(--border);
+  display: flex; align-items: center; justify-content: center;
+  margin: 0 auto 16px;
+}
+.empty-state-icon svg { width: 28px; height: 28px; color: var(--text-4); }
+.empty-state-title { font-size: 15px; font-weight: 800; color: var(--text-2); }
+.empty-state-sub { font-size: 13px; color: var(--text-4); margin-top: 6px; line-height: 1.6; }
+
+/* ── Filter Bar ── */
+.filter-bar {
+  display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-2);
+}
+.filter-bar select, .filter-bar input {
+  width: auto; min-width: 120px; flex: 1;
+}
+
+/* ── Compliance Progress ── */
+.compliance-bar {
+  height: 8px;
+  background: var(--border);
+  border-radius: 99px;
+  overflow: hidden;
+}
+.compliance-fill {
+  height: 100%;
+  border-radius: 99px;
+  transition: width .8s ease;
+}
+.compliance-fill.high   { background: linear-gradient(90deg, #10b981, #06b6d4); }
+.compliance-fill.medium { background: linear-gradient(90deg, #f59e0b, #f97316); }
+.compliance-fill.low    { background: linear-gradient(90deg, #ef4444, #ec4899); }
+
+/* ── Section Header ── */
+.section-header {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 20px;
+}
+.section-title { font-size: 18px; font-weight: 900; color: var(--text-1); letter-spacing: -.4px; }
+.section-sub { font-size: 13px; color: var(--text-4); margin-top: 3px; }
+
+/* ── Stats mini chips ── */
+.mini-stat-row {
+  display: flex; gap: 8px; flex-wrap: wrap;
+  margin-bottom: 20px;
+}
+.mini-stat {
+  display: flex; align-items: center; gap: 7px;
+  padding: 8px 14px;
+  border-radius: 99px;
+  font-size: 12.5px; font-weight: 700;
+  border: 1.5px solid;
+}
+
+/* ── Compliance overview stats ── */
+.compliance-overview {
+  display: flex; gap: 0;
+  border: 1.5px solid var(--border);
+  border-radius: var(--r-lg);
+  overflow: hidden;
+  margin-bottom: 20px;
+  background: var(--surface);
+}
+.comp-stat {
+  flex: 1; padding: 18px 16px; text-align: center;
+  border-right: 1px solid var(--border);
+}
+.comp-stat:last-child { border-right: none; }
+.comp-stat-val { font-size: 26px; font-weight: 900; letter-spacing: -1px; }
+.comp-stat-lbl { font-size: 11px; font-weight: 700; color: var(--text-4); text-transform: uppercase; letter-spacing: .06em; margin-top: 3px; }
+
+/* ── Search ── */
+.search-input-wrap {
+  position: relative; flex: 1; min-width: 200px;
+}
+.search-input-wrap input { padding-left: 38px; }
+.search-icon {
+  position: absolute; left: 12px; top: 50%;
+  transform: translateY(-50%);
+  color: var(--text-4);
+  pointer-events: none;
+}
+.search-icon svg { width: 15px; height: 15px; }
+
+/* ── Profile ── */
+.profile-header {
+  background: linear-gradient(135deg, #071c19, #060e22);
+  border-radius: var(--r-xl);
+  padding: 32px;
+  display: flex; align-items: center; gap: 20px;
+  margin-bottom: 24px;
+  position: relative; overflow: hidden;
+}
+.profile-header::before {
+  content: ''; position: absolute;
+  width: 250px; height: 250px;
+  border-radius: 50%;
+  background: radial-gradient(circle,rgba(13,148,136,.2),transparent 70%);
+  top: -80px; right: -60px;
+}
+.profile-avatar-lg {
+  width: 70px; height: 70px;
+  border-radius: 18px;
+  background: linear-gradient(135deg, #0d9488, #0891b2);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 28px; font-weight: 900; color: #fff;
+  flex-shrink: 0;
+  box-shadow: 0 6px 20px rgba(13,148,136,.35);
+  border: 3px solid rgba(255,255,255,.15);
+}
+.profile-name { font-size: 20px; font-weight: 900; color: #fff; }
+.profile-role { font-size: 13px; color: rgba(255,255,255,.5); margin-top: 4px; }
+.profile-stats {
+  display: flex; gap: 20px; margin-top: 12px;
+}
+.profile-stat-item { text-align: center; }
+.profile-stat-val { font-size: 20px; font-weight: 900; color: #fff; }
+.profile-stat-lbl { font-size: 10.5px; color: rgba(255,255,255,.4); }
+
+/* ── Audit log action badges ── */
+.action-badge {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 3px 9px;
+  border-radius: 99px;
+  font-size: 10.5px; font-weight: 800;
+  letter-spacing: .04em;
+  font-family: 'JetBrains Mono', monospace;
+}
+.ab-login   {background:var(--green-bg);color:var(--green-mid);border:1px solid var(--green-border);}
+.ab-logout  {background:var(--surface-3);color:var(--text-3);border:1px solid var(--border);}
+.ab-upload  {background:var(--blue-bg);color:var(--blue-mid);border:1px solid var(--blue-border);}
+.ab-download{background:var(--purple-bg);color:var(--purple-mid);border:1px solid var(--purple-border);}
+.ab-delete  {background:var(--red-bg);color:var(--red-mid);border:1px solid var(--red-border);}
+.ab-create  {background:var(--green-bg);color:var(--green-mid);border:1px solid var(--green-border);}
+.ab-toggle  {background:var(--yellow-bg);color:var(--yellow-mid);border:1px solid var(--yellow-border);}
+.ab-export  {background:var(--cyan-bg);color:var(--cyan-mid);border:1px solid var(--cyan-border);}
+.ab-default {background:var(--surface-3);color:var(--text-3);border:1px solid var(--border);}
+
+/* ── Progress Ring (SVG) ── */
+.progress-ring { transform: rotate(-90deg); }
+.progress-ring-bg { fill: none; stroke: var(--border); stroke-width: 5; }
+.progress-ring-fill { fill: none; stroke-width: 5; stroke-linecap: round; transition: stroke-dashoffset 1s ease; }
+
+/* ── Dashboard — quick action ── */
+.quick-actions { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 24px; }
+.quick-action-btn {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 8px; padding: 16px 20px;
+  border-radius: var(--r-lg);
+  border: 1.5px solid var(--border);
+  background: var(--surface);
+  color: var(--text-2);
+  font-size: 12.5px; font-weight: 700;
+  cursor: pointer; transition: all var(--t);
+  min-width: 100px;
+  text-align: center;
+  box-shadow: var(--shadow-xs);
+}
+.quick-action-btn svg { width: 22px; height: 22px; }
+.quick-action-btn:hover {
+  border-color: var(--brand);
+  color: var(--brand);
+  background: var(--brand-xlight);
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-sm);
+}
+
+/* ── Error page ── */
+.error-page {
+  min-height: 100vh;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--bg);
+}
+.error-card {
+  background: var(--surface);
+  border-radius: var(--r-2xl);
+  padding: 48px;
+  text-align: center;
+  max-width: 460px;
+  width: 90%;
+  box-shadow: var(--shadow-lg);
+  border: 1px solid var(--border);
+}
+.error-code {
+  font-size: 80px; font-weight: 900;
+  background: linear-gradient(135deg,#0d9488,#0891b2);
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  line-height: 1;
+}
+
+/* ============================================================
+   RESPONSIVE — Mobile First
+   ============================================================ */
+@media (max-width: 1024px) {
+  .grid-70-30 { grid-template-columns: 1fr; }
+  .login-left { display: none; }
+  .login-right { width: 100%; padding: 40px 28px; }
+}
+
+@media (max-width: 768px) {
+  :root { --sidebar-w: 272px; --topbar-h: 58px; }
+
+  /* Sidebar hides off-screen on mobile */
+  .sidebar {
+    transform: translateX(-100%);
+    box-shadow: none;
+  }
+  .sidebar.open {
+    transform: translateX(0);
+    box-shadow: 6px 0 40px rgba(0,0,0,.35);
+  }
+
+  /* Main takes full width */
+  .main { margin-left: 0; }
+
+  /* Show hamburger */
+  .btn-menu { display: flex; }
+
+  .content { padding: 16px; }
+
+  .grid-2 { grid-template-columns: 1fr; }
+  .grid-3 { grid-template-columns: 1fr 1fr; }
+  .form-row-2 { grid-template-columns: 1fr; }
+  .form-row-3 { grid-template-columns: 1fr; }
+  .col-span-2 { grid-column: span 1; }
+  .col-span-3 { grid-column: span 1; }
+
+  .stats-grid { grid-template-columns: repeat(2, 1fr); gap: 12px; }
+  .stat-val { font-size: 24px; }
+
+  .section-header { flex-direction: column; align-items: flex-start; gap: 10px; }
+
+  .filter-bar { flex-direction: column; align-items: stretch; }
+  .filter-bar select, .filter-bar input { width: 100%; }
+
+  .profile-header { flex-direction: column; text-align: center; padding: 24px; }
+  .profile-header::before { display: none; }
+  .profile-stats { justify-content: center; }
+
+  .compliance-overview { flex-direction: column; }
+  .comp-stat { border-right: none; border-bottom: 1px solid var(--border); }
+
+  .modal { padding: 22px; border-radius: var(--r-xl); }
+
+  .notif-dropdown { width: calc(100vw - 24px); right: -8px; max-width: 340px; }
+
+  .login-page { min-height: 100vh; }
+  .login-right { padding: 36px 24px; }
+
+  .topbar { padding: 0 16px; gap: 10px; }
+  .topbar-title { font-size: 14.5px; }
+  .role-pill { display: none; }
+
+  .data-table thead { display: none; }
+  .data-table tbody tr {
+    display: block;
+    padding: 12px 0;
+    border-bottom: 2px solid var(--border) !important;
+  }
+  .data-table tbody td {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 5px 16px;
+    border-bottom: none;
+  }
+  .data-table tbody td::before {
+    content: attr(data-label);
+    font-size: 11px;
+    font-weight: 800;
+    color: var(--text-4);
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    flex-shrink: 0;
+    margin-right: 10px;
+  }
+  .td-clamp { max-width: 160px; }
+
+  .quick-actions { gap: 8px; }
+  .quick-action-btn { padding: 12px 14px; min-width: 80px; font-size: 11.5px; }
+}
+
+@media (max-width: 480px) {
+  .stats-grid { grid-template-columns: 1fr 1fr; gap: 10px; }
+  .stat-card { padding: 12px; }
+  .stat-val { font-size: 22px; }
+  .stat-icon-box { width: 36px; height: 36px; }
+  .stat-icon-box svg { width: 17px; height: 17px; }
+  .grid-3 { grid-template-columns: 1fr; }
+  .login-right { padding: 28px 20px; }
+
+  .content { padding: 10px; }
+
+  /* Tabel aksi: tombol lebih kecil */
+  .btn-sm { padding: 5px 10px; font-size: 11px; }
+
+  /* Modal full-bottom-sheet di layar sangat kecil */
+  .modal-overlay { align-items: flex-end; }
+  .modal {
+    width: 100%;
+    border-bottom-left-radius: 0;
+    border-bottom-right-radius: 0;
+    max-height: 88vh;
+    padding: 16px;
+    animation: slide-up-modal .28s cubic-bezier(.34,1.2,.64,1);
+  }
+  @keyframes slide-up-modal {
+    from { transform: translateY(40px); opacity: 0; }
+    to   { transform: translateY(0);    opacity: 1; }
+  }
+
+  /* Section header tombol full width */
+  .section-header { gap: 8px; }
+  .section-header .btn { font-size: 12.5px; }
+
+  /* Search form stack */
+  .mb-20 form > div { flex-direction: column; }
+  .mb-20 form .btn { width: 100%; justify-content: center; }
+
+  /* Tabel kolom user: kurangi padding avatar */
+  .data-table tbody td { padding: 5px 10px; }
+}
+
+/* ── Touch Optimizations ── */
+@media (hover: none) {
+  .nav-item:hover { transform: none; }
+  .stat-card:hover { transform: none; }
+  .btn-primary:hover { transform: none; }
+  .reminder-card:hover { transform: none; }
+}
+
+/* ── Safe Area (iPhone notch etc) ── */
+@supports (padding-bottom: env(safe-area-inset-bottom)) {
+  .sidebar-footer {
+    padding-bottom: calc(12px + env(safe-area-inset-bottom));
+  }
+  .topbar {
+    padding-left: max(14px, env(safe-area-inset-left));
+    padding-right: max(14px, env(safe-area-inset-right));
+  }
+  .content {
+    padding-left: max(14px, env(safe-area-inset-left));
+    padding-right: max(14px, env(safe-area-inset-right));
+  }
+}
+
+/* ── Utility ── */
+.sr-only { position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);border:0; }
+.flex { display: flex; } .flex-col { flex-direction: column; }
+.items-center { align-items: center; } .justify-between { justify-content: space-between; }
+.gap-8 { gap: 8px; } .gap-12 { gap: 12px; } .gap-16 { gap: 16px; }
+.text-center { text-align: center; }
+.font-mono { font-family: 'JetBrains Mono', monospace; }
+.truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.w-full { width: 100%; }
+.mt-4{margin-top:4px} .mt-8{margin-top:8px} .mt-12{margin-top:12px} .mt-16{margin-top:16px}
+
+/* ── Animated counter ── */
+@keyframes count-up {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: none; }
+}
+.stat-val.animate { animation: count-up .5s ease forwards; }
+
+
+
+
+
+
+
+/* ── Viewport height fix untuk iOS Safari ── */
+/* JS di base.html harus set: document.documentElement.style.setProperty('--vh', window.innerHeight * 0.01 + 'px') */
+
+/* ── Prevent zoom on input focus (iOS) ── */
+@media (max-width: 768px) {
+  input[type=text],
+  input[type=password],
+  input[type=email],
+  input[type=number],
+  input[type=search],
+  select,
+  textarea {
+    font-size: 16px !important;
+  }
+}
