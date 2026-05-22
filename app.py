@@ -1,5 +1,5 @@
 """
-Sistem Akreditasi RS 
+Sistem Akreditasi RS
 Developer-grade upgrade: rate limiting, pagination, notifications,
 profile management, activity feed, password change, advanced search.
 """
@@ -662,19 +662,46 @@ def create_app() -> Flask:
             page=page, total_pages=total_pages, total=total)
 
     # ── Analytics API ─────────────────────────────────────────────────────────
+
     @app.route("/api/analytics")
     @login_required
     def api_analytics():
-        uploads_chart = g.db.execute("""
-            SELECT DATE(uploaded_at) AS tgl, COUNT(*) AS total
-            FROM files WHERE DATE(uploaded_at)>=DATE('now','-30 days')
-            GROUP BY tgl ORDER BY tgl
+        # ── 1. GENERATE RENTANG 7 HARI TERAKHIR (1 MINGGU) ──
+        today_dt = datetime.now(UTC).date()
+        date_list = [str(today_dt - timedelta(days=i)) for i in range(6, -1, -1)]
+
+        # Ambil statistik upload dari database filter 7 hari terakhir
+        raw_uploads = g.db.execute("""
+            SELECT SUBSTR(uploaded_at, 1, 10) AS tgl, COUNT(*) AS total
+            FROM files
+            WHERE SUBSTR(uploaded_at, 1, 10) >= DATE('now', '-7 days')
+            GROUP BY tgl
         """).fetchall()
+
+        db_data = {r["tgl"]: r["total"] for r in raw_uploads}
+        id_months = ["Jan", "Feb", "Mar", "Apr", "Mei", "Jun", "Jul", "Agu", "Sep", "Okt", "Nov", "Des"]
+
+        formatted_chart = []
+        for date_str in date_list:
+            y, m, d = date_str.split("-")
+            month_label = id_months[int(m) - 1]
+            total_upload = db_data.get(date_str, 0)
+
+            # Tampilkan semua label tanggal harian karena rentang waktu pendek
+            display_label = f"{int(d)} {month_label}"
+
+            formatted_chart.append({
+                "tgl": display_label,
+                "total": total_upload
+            })
+
+        # ── 2. DATA ANALISIS KARTU DAN TABEL LAINNYA ──
         pokja_chart = g.db.execute("""
             SELECT p.name, COUNT(f.id) AS total
             FROM pokja p LEFT JOIN files f ON f.pokja_id=p.id
             GROUP BY p.id ORDER BY total DESC
         """).fetchall()
+
         compliance = g.db.execute("""
             SELECT s.kode, s.nama, s.target_dokumen, COUNT(f.id) AS uploaded, p.name AS pokja_name
             FROM standar s
@@ -682,15 +709,18 @@ def create_app() -> Flask:
             LEFT JOIN pokja p ON p.id=s.pokja_id
             GROUP BY s.id ORDER BY s.kode
         """).fetchall()
+
         type_dist = g.db.execute("""
             SELECT file_type, COUNT(*) AS total FROM files WHERE file_type!='' GROUP BY file_type ORDER BY total DESC
         """).fetchall()
+
         weekly = g.db.execute("""
             SELECT strftime('%w', uploaded_at) AS dow, COUNT(*) AS total
             FROM files GROUP BY dow ORDER BY dow
         """).fetchall()
+
         return jsonify({
-            "uploads_chart": [dict(r) for r in uploads_chart],
+            "uploads_chart": formatted_chart,
             "pokja_chart":   [dict(r) for r in pokja_chart],
             "type_dist":     [dict(r) for r in type_dist],
             "weekly":        [dict(r) for r in weekly],
@@ -700,6 +730,8 @@ def create_app() -> Flask:
                 "pct": min(100, round(r["uploaded"] / max(r["target_dokumen"], 1) * 100))
             } for r in compliance]
         })
+
+
 
     # ── Export ────────────────────────────────────────────────────────────────
     @app.route("/export/csv")
@@ -825,7 +857,9 @@ def _stats(db, allowed_ids, role):
     ).fetchall()
     pct = sum(min(100, r["up"] / max(r["target_dokumen"], 1) * 100) for r in rows) / len(rows) if rows else 0
     today = db.execute(
-        "SELECT COUNT(*) FROM files WHERE DATE(uploaded_at)=DATE('now')", []).fetchone()[0]
+
+        "SELECT COUNT(*) FROM files WHERE SUBSTR(uploaded_at, 1, 10)=DATE('now')", []).fetchone()[0]
+
     return {
         "total_files": total_files, "total_pokja": total_pokja,
         "total_standar": total_standar, "total_users": total_users,
